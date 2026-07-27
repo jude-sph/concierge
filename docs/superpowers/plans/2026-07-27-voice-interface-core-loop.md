@@ -2557,13 +2557,18 @@ from .events import EventLog
 from .policy import AskConcierge, PolicyState, SendUtterance, Stop, decide
 from .protocol import OrchestratorMessage, ReasonerMessage
 from .registry import TaskRegistry, TaskStatus
-from .states import TurnEvent
+from .states import TurnEvent, UserState
 
 SPEAK_ON = {"done", "failed", "need_clarification", "confirm_required"}
 
 
 class Orchestrator:
-    def __init__(self, reasoner, concierge, voice, log: EventLog, device) -> None:
+    def __init__(
+        self, reasoner, concierge, voice, log: EventLog, device,
+        silence_timeout_ms: int = 2000,
+        reasoner_timeout_s: float = 20.0,
+        use_concierge: bool = True,
+    ) -> None:
         self.reasoner = reasoner
         self.concierge = concierge
         self.voice = voice
@@ -2574,6 +2579,20 @@ class Orchestrator:
         self.history: list[dict] = []
         self.tokens: dict[str, CancellationToken] = {}
         self._seq = 0
+        self.silence_timeout_ms = silence_timeout_ms
+        self.reasoner_timeout_s = reasoner_timeout_s
+        self.use_concierge = use_concierge
+        self._pending_partial: str | None = None
+        self._pending_since_ms: int | None = None
+        # Set by on_tick() when the silence timer forces a dispatch. If the
+        # turn-taking model later catches up and emits a genuine COMPLETE for
+        # the exact same text, on_turn_event must recognise the utterance as
+        # already handled instead of dispatching it a second time (or, worse,
+        # routing it into _dispatch's "awaiting confirm" branch where it would
+        # be misread as a yes/no answer to the task the forced dispatch just
+        # created). A COMPLETE carrying MORE text than this is genuinely new
+        # content and is dispatched normally.
+        self._force_dispatched_text: str | None = None
 
         # Speech generation counter (same pattern as tts.py's KokoroTTS): every
         # Stop() bumps it, and an in-flight _ask_concierge that captured an
@@ -2596,9 +2615,41 @@ class Orchestrator:
         self._seq += 1
         return self._seq
 
+    async def on_tick(self, now_ms: int) -> None:
+        """Drive the silence timeout. Called ~every 160ms by voice-service.
+
+        SoulX-Duplug declining to take the turn is normally correct, but if it
+        never fires the system would hang. After silence_timeout_ms of holding
+        an incomplete utterance, dispatch it anyway.
+        """
+        if self._pending_since_ms is None or self._pending_partial is None:
+            return
+        if now_ms - self._pending_since_ms < self.silence_timeout_ms:
+            return
+        text = self._pending_partial
+        self._pending_partial = None
+        self._pending_since_ms = None
+        self._force_dispatched_text = text
+        self.log.append("silence_timeout", transcript=text)
+        self.history.append({"role": "user", "content": text})
+        await self._dispatch(text)
+
     async def on_turn_event(self, ev: TurnEvent) -> None:
         self.log.append("turn_event", state=ev.state.value,
                         transcript=ev.transcript, t_ms=ev.t_ms)
+
+        if ev.state is UserState.INCOMPLETE and ev.transcript.strip():
+            self._pending_partial = ev.transcript
+            self._pending_since_ms = ev.t_ms
+        elif ev.state in (UserState.COMPLETE, UserState.NONIDLE):
+            # NONIDLE means the user resumed speaking: the timer that was
+            # armed for the PREVIOUS incomplete utterance must not keep
+            # counting down against fresh speech, or on_tick will force-
+            # dispatch a stale partial while the user is still mid-sentence.
+            # A later INCOMPLETE (if the model declines the turn again)
+            # re-arms it naturally, from the correct new t_ms.
+            self._pending_partial = None
+            self._pending_since_ms = None
 
         # SendUtterance (-> reasoner) and AskConcierge (-> concierge) are
         # launched concurrently, never one awaited before the other starts.
@@ -2617,11 +2668,30 @@ class Orchestrator:
                 self.log.append("tts_stopped")
 
             elif isinstance(action, SendUtterance):
-                self.history.append({"role": "user", "content": action.text})
-                concurrent.append(asyncio.create_task(self._dispatch(action.text)))
+                if (self._force_dispatched_text is not None
+                        and action.text == self._force_dispatched_text):
+                    # The silence timer already force-dispatched this exact
+                    # text (see on_tick). The turn-taking model has now
+                    # caught up and emitted the genuine COMPLETE for the same
+                    # utterance -- it is not new content, so do not dispatch
+                    # it again (that would either duplicate the work, or, if
+                    # a task is AWAITING_CONFIRM, get misread by _dispatch as
+                    # a yes/no answer to it).
+                    self._force_dispatched_text = None
+                    self.log.append("silence_timeout_reconciled", transcript=action.text)
+                else:
+                    self._force_dispatched_text = None
+                    self.history.append({"role": "user", "content": action.text})
+                    concurrent.append(asyncio.create_task(self._dispatch(action.text)))
 
             elif isinstance(action, AskConcierge):
-                concurrent.append(asyncio.create_task(self._ask_concierge(action.trigger)))
+                # use_concierge=False must genuinely bypass the concierge on
+                # every path, not just the reasoner_update ask -- otherwise
+                # the flag can't be used to measure whether the concierge
+                # earns its place, since it would still speak filler on
+                # every ordinary turn.
+                if self.use_concierge:
+                    concurrent.append(asyncio.create_task(self._ask_concierge(action.trigger)))
 
         if concurrent:
             # return_exceptions=True: one branch raising must not leave its
@@ -2647,7 +2717,24 @@ class Orchestrator:
 
         data = msg.model_dump()
         self.log.append("to_reasoner", msg_kind=data.pop("kind"), **data)
-        await self.on_reasoner_messages(await self.reasoner.handle(msg))
+        try:
+            replies = await asyncio.wait_for(
+                self.reasoner.handle(msg), timeout=self.reasoner_timeout_s
+            )
+        except asyncio.TimeoutError:
+            self.log.append("reasoner_timeout", seq=msg.seq)
+            # A fresh utterance has no task_id yet (only clarification_answer
+            # messages carry the id of the task they're answering). Falling
+            # back to a fixed literal here would collapse every timed-out
+            # fresh utterance onto the same task id; the registry's
+            # terminal-state guard then silently swallows every timeout after
+            # the first, since that id is already FAILED. Derive a unique id
+            # from the message's own seq instead.
+            replies = [ReasonerMessage(
+                kind="failed", task_id=msg.task_id or f"timeout-{msg.seq}",
+                reason="timed out waiting for the reasoner",
+            )]
+        await self.on_reasoner_messages(replies)
 
     async def on_reasoner_messages(self, msgs: list[ReasonerMessage]) -> None:
         should_speak = False
@@ -2661,8 +2748,33 @@ class Orchestrator:
                 self.policy_state.pending_question = m.verbatim_text
             if m.kind in ("done", "failed"):
                 self.policy_state.pending_question = None
-        if should_speak:
+        if not should_speak:
+            return
+        if self.use_concierge:
             await self._ask_concierge("reasoner_update")
+            return
+        # Bypass: speak the reasoner's verbatim text directly, without the
+        # concierge in the loop at all. Nothing can be invented because
+        # nothing is generated -- this exists so "does the concierge earn
+        # its keep" can be measured against a real baseline. Still routed
+        # through the same generation-check + speak lock as _ask_concierge
+        # so a Stop() during a bypassed reply can't leave stale audio
+        # playing or overlap with a barge-in.
+        gen = self._speech_gen
+        for m in msgs:
+            if m.kind in SPEAK_ON:
+                text = m.result or m.reason or m.verbatim_text or m.question
+                if not text:
+                    continue
+                async with self._speak_lock:
+                    if gen != self._speech_gen:
+                        self.log.append("speak_skipped_stale",
+                                        trigger="reasoner_update_bypass", text=text)
+                        continue
+                    self.history.append({"role": "assistant", "content": text})
+                    self.policy_state.speaking = True
+                    await self.voice.speak(text, uuid.uuid4().hex)
+                    self.policy_state.speaking = False
 
     async def _ask_concierge(self, trigger: str) -> None:
         # Snapshot the speech generation before doing anything async. If a
