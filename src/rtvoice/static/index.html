@@ -2,138 +2,223 @@
 <style>
   :root {
     color-scheme: dark;
-    --bg: #0b0d10;
-    --panel: #14171c;
-    --panel-border: #2a2f38;
-    --fg: #e8ecf1;
+    --bg: #08090b;
+    --panel: #131519;
+    --panel-soft: #1a1d22;
+    --hairline: #2a2e35;
+    --fg: #f2f4f7;
     --fg-dim: #8b93a1;
+    --fg-faint: #565d69;
     --accent: #4fd1c5;
-    --user: #6ab0ff;
+    --user: #7ab8ff;
     --assistant: #4fd1c5;
-    --warn: #f5a623;
+    --warn: #ffb02e;
+    --warn-bg: rgba(255, 176, 46, 0.14);
     --bad: #ff5c5c;
-    --good: #4caf50;
+    --good: #52d17a;
+    --highlight: #52ffcf;
+    --highlight-bg: rgba(82, 255, 207, 0.16);
   }
   * { box-sizing: border-box; }
   html, body {
     margin: 0; padding: 0; height: 100%;
     background: var(--bg); color: var(--fg);
-    font-family: "SF Mono", Menlo, Consolas, "Courier New", monospace;
-    font-size: 15px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 16px;
   }
   body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
 
+  /* ---------- top bar: mic control only, no product banner ---------- */
+
   header {
-    display: flex; align-items: center; gap: 20px;
-    padding: 10px 16px; background: #10131a; border-bottom: 1px solid var(--panel-border);
-    flex: 0 0 auto;
+    display: flex; align-items: center; gap: 18px;
+    padding: 14px 20px; flex: 0 0 auto;
   }
-  header h1 { font-size: 16px; margin: 0; color: var(--fg-dim); font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; }
 
   #btn-start-stop {
-    font-size: 20px; font-weight: 700; padding: 12px 34px; border-radius: 10px;
+    font-family: inherit; font-size: 18px; font-weight: 700; letter-spacing: 0.02em;
+    padding: 14px 32px; border-radius: 999px;
     border: 2px solid var(--accent); background: transparent; color: var(--accent);
-    cursor: pointer; letter-spacing: 0.05em;
+    cursor: pointer; min-width: 210px;
   }
-  #btn-start-stop.running { background: var(--bad); border-color: var(--bad); color: #1a0000; }
+  #btn-start-stop.running {
+    background: var(--bad); border-color: var(--bad); color: #1a0000;
+    animation: mic-pulse 1.6s ease-in-out infinite;
+  }
+  @keyframes mic-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(255, 92, 92, 0.55); }
+    50%      { box-shadow: 0 0 0 12px rgba(255, 92, 92, 0); }
+  }
 
-  .status-chip { padding: 4px 10px; border-radius: 999px; border: 1px solid var(--panel-border); font-size: 13px; color: var(--fg-dim); }
-  .status-chip.on { color: var(--good); border-color: var(--good); }
-  .status-chip.speaking { color: var(--warn); border-color: var(--warn); }
-  .status-chip.bad { color: var(--bad); border-color: var(--bad); }
+  .conn-status { display: flex; flex-direction: column; gap: 2px; font-size: 12px; color: var(--fg-faint); }
+  .conn-status span.bad { color: var(--bad); }
 
-  #mic-error { color: var(--bad); font-size: 13px; }
+  #mic-error { color: var(--bad); font-size: 14px; font-weight: 600; }
+
+  /* ---------- main layout ---------- */
 
   main {
     flex: 1 1 auto; display: grid; min-height: 0;
-    grid-template-columns: 1.1fr 1fr 0.9fr 1.1fr;
-    gap: 1px; background: var(--panel-border);
+    grid-template-columns: 1.5fr 1fr;
+    gap: 18px; padding: 0 20px 16px;
   }
-  .panel { background: var(--panel); display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+
+  .panel { background: var(--panel); border-radius: 14px; display: flex; flex-direction: column; min-height: 0; min-width: 0; }
   .panel h2 {
-    margin: 0; padding: 8px 12px; font-size: 12px; text-transform: uppercase;
-    letter-spacing: 0.08em; color: var(--fg-dim); border-bottom: 1px solid var(--panel-border);
-    flex: 0 0 auto;
+    margin: 0; padding: 14px 20px 10px; font-size: 13px; text-transform: uppercase;
+    letter-spacing: 0.09em; color: var(--fg-dim); font-weight: 700;
+    flex: 0 0 auto; display: flex; align-items: center; gap: 10px;
   }
-  .panel-body { flex: 1 1 auto; overflow-y: auto; padding: 8px 12px; min-height: 0; }
-  .panel-body.mono { white-space: pre-wrap; word-break: break-word; font-size: 12.5px; line-height: 1.5; color: var(--fg-dim); }
 
-  .msg-user, .msg-assistant { margin-bottom: 10px; line-height: 1.4; }
-  .msg-user b { color: var(--user); }
-  .msg-assistant b { color: var(--assistant); }
-  .silent-tag { color: var(--warn); font-size: 12px; }
+  .sidebar { display: flex; flex-direction: column; gap: 18px; min-height: 0; }
 
-  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
-  th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--panel-border); vertical-align: top; }
-  th { color: var(--fg-dim); font-weight: 600; position: sticky; top: 0; background: var(--panel); }
-  .empty { color: var(--fg-dim); font-style: italic; padding: 6px 0; }
+  /* ---------- conversation: the spine ---------- */
 
-  tr.status-done { color: var(--good); }
-  tr.status-failed, tr.status-cancelled { color: var(--bad); }
-  tr.status-running, tr.status-pending { color: var(--fg); }
-  tr.status-awaiting_confirm { color: var(--warn); }
-
-  @keyframes flash-row {
-    from { background: rgba(79, 209, 197, 0.35); }
-    to   { background: transparent; }
+  .conversation-panel { flex: 1 1 auto; }
+  #waiting-banner {
+    display: none; margin: 0 20px 10px; padding: 12px 16px; border-radius: 10px;
+    background: var(--warn-bg); color: var(--warn); font-size: 16px; font-weight: 600;
   }
-  tr.flash { animation: flash-row 1.4s ease-out; }
+  #waiting-banner.show { display: block; }
 
-  .device-table { margin-bottom: 16px; }
-  .device-table h4 { margin: 0 0 4px; font-size: 12px; color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.06em; }
+  .conversation-body { flex: 1 1 auto; overflow-y: auto; padding: 4px 20px 20px; min-height: 0; }
+  .turn { margin-bottom: 20px; line-height: 1.5; font-size: 19px; max-width: 92%; }
+  .turn .who { display: block; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.07em; margin-bottom: 4px; }
+  .turn.user { margin-right: auto; }
+  .turn.assistant { margin-left: auto; text-align: right; }
+  .turn.user .who { color: var(--user); }
+  .turn.assistant .who { color: var(--assistant); }
+  .turn.user .bubble { background: rgba(122, 184, 255, 0.10); border-radius: 14px 14px 14px 4px; padding: 10px 16px; display: inline-block; text-align: left; }
+  .turn.assistant .bubble { background: rgba(79, 209, 197, 0.10); border-radius: 14px 14px 4px 14px; padding: 10px 16px; display: inline-block; text-align: left; }
+  .silent-tag { display: block; color: var(--warn); font-size: 12px; font-weight: 600; margin-top: 4px; }
+  .empty { color: var(--fg-faint); font-style: italic; padding: 6px 20px 20px; }
+
+  /* ---------- tasks: what it's doing ---------- */
+
+  .tasks-panel { flex: 0 1 auto; max-height: 52%; }
+  .tasks-body { flex: 1 1 auto; overflow-y: auto; padding: 4px 16px 16px; min-height: 0; }
+
+  .task-card {
+    border-radius: 10px; padding: 12px 16px; margin-bottom: 10px;
+    background: var(--panel-soft); border-left: 4px solid var(--fg-faint);
+  }
+  .task-card .task-what { font-size: 16px; font-weight: 600; }
+  .task-card .task-status { display: inline-block; margin-top: 6px; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--fg-dim); }
+  .task-card .task-detail { margin-top: 6px; font-size: 14px; color: var(--fg-dim); }
+
+  .task-card.status-done { border-left-color: var(--good); }
+  .task-card.status-done .task-status { color: var(--good); }
+  .task-card.status-running { border-left-color: var(--accent); }
+  .task-card.status-running .task-status { color: var(--accent); }
+  .task-card.status-pending .task-status { color: var(--fg-dim); }
+  .task-card.status-failed, .task-card.status-cancelled { border-left-color: var(--bad); opacity: 0.85; }
+  .task-card.status-failed .task-status, .task-card.status-cancelled .task-status { color: var(--bad); }
+
+  .task-card.needs-confirm {
+    border-left: none; background: var(--warn-bg); padding: 18px 20px;
+    animation: confirm-pulse 1.8s ease-in-out infinite;
+  }
+  .task-card.needs-confirm .task-what { font-size: 19px; }
+  .task-card.needs-confirm .task-status { color: var(--warn); font-size: 13px; }
+  .task-card.needs-confirm .task-detail { color: var(--fg); font-size: 15px; }
+  @keyframes confirm-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(255, 176, 46, 0.45); }
+    50%      { box-shadow: 0 0 0 10px rgba(255, 176, 46, 0); }
+  }
+
+  .task-card.flash { animation: card-flash 2.2s ease-out; }
+  @keyframes card-flash {
+    0%   { background: var(--highlight-bg); }
+    100% { background: var(--panel-soft); }
+  }
+
+  /* ---------- device data: the payoff ---------- */
+
+  .device-panel { flex: 1 1 auto; }
+  .device-body { flex: 1 1 auto; overflow-y: auto; padding: 4px 20px 20px; min-height: 0; }
+
+  .device-table { margin-bottom: 20px; }
+  .device-table h4 { margin: 0 0 6px; font-size: 12px; color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.07em; font-weight: 700; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--hairline); vertical-align: top; }
+  th { color: var(--fg-dim); font-weight: 600; font-size: 12px; }
+
+  tr.row-changed td { background: var(--highlight-bg); }
+  tr.row-changed { animation: row-flash 2.2s ease-out; }
+  @keyframes row-flash {
+    0%   { background: rgba(82, 255, 207, 0.45); }
+    100% { background: transparent; }
+  }
+
+  /* ---------- footer: text fallback + collapsed raw log ---------- */
 
   footer {
-    flex: 0 0 auto; display: flex; gap: 8px; padding: 10px 16px;
-    background: #10131a; border-top: 1px solid var(--panel-border);
+    flex: 0 0 auto; padding: 12px 20px 16px;
   }
+  #inject-form { display: flex; gap: 8px; opacity: 0.85; }
   #inject-text {
-    flex: 1; font-family: inherit; font-size: 15px; padding: 10px 12px;
-    background: #0b0d10; border: 1px solid var(--panel-border); border-radius: 6px; color: var(--fg);
+    flex: 1; font-family: inherit; font-size: 14px; padding: 9px 12px;
+    background: var(--panel); border: 1px solid var(--hairline); border-radius: 8px; color: var(--fg);
   }
   #inject-form button {
-    font-family: inherit; font-size: 14px; padding: 10px 20px; border-radius: 6px;
-    border: 1px solid var(--accent); background: transparent; color: var(--accent); cursor: pointer;
+    font-family: inherit; font-size: 13px; padding: 9px 18px; border-radius: 8px;
+    border: 1px solid var(--hairline); background: transparent; color: var(--fg-dim); cursor: pointer;
+  }
+
+  details#raw-log { margin-top: 8px; }
+  details#raw-log summary {
+    cursor: pointer; font-size: 12px; color: var(--fg-faint); text-transform: uppercase;
+    letter-spacing: 0.06em; user-select: none;
+  }
+  #event-log-body {
+    margin-top: 8px; max-height: 180px; overflow-y: auto;
+    font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 11.5px; line-height: 1.5;
+    color: var(--fg-faint); white-space: pre-wrap; word-break: break-word;
+    background: var(--panel); border-radius: 8px; padding: 8px 10px;
   }
 </style>
 
 <header>
-  <h1>rtvoice demo</h1>
-  <button id="btn-start-stop">Start</button>
-  <span id="chip-mic" class="status-chip">mic: off</span>
-  <span id="chip-audio" class="status-chip">audio: off</span>
-  <span id="chip-events" class="status-chip">events: connecting</span>
-  <span id="chip-speaking" class="status-chip">idle</span>
+  <button id="btn-start-stop">Start listening</button>
+  <div class="conn-status">
+    <span id="chip-mic">mic off</span>
+    <span id="chip-audio">audio off</span>
+    <span id="chip-events">events connecting…</span>
+  </div>
   <span id="mic-error"></span>
 </header>
 
 <main>
-  <section class="panel">
-    <h2>Transcript</h2>
-    <div id="transcript-body" class="panel-body"></div>
+  <section class="panel conversation-panel">
+    <h2>Conversation</h2>
+    <div id="waiting-banner"></div>
+    <div id="transcript-body" class="conversation-body"><div class="empty">Say something to get started.</div></div>
   </section>
 
-  <section class="panel">
-    <h2>Tasks</h2>
-    <div id="tasks-body" class="panel-body"><div class="empty">(none yet)</div></div>
-  </section>
+  <div class="sidebar">
+    <section class="panel tasks-panel">
+      <h2>What it's doing</h2>
+      <div id="tasks-body" class="tasks-body"><div class="empty">Nothing yet.</div></div>
+    </section>
 
-  <section class="panel">
-    <h2>Device state</h2>
-    <div id="device-body" class="panel-body"></div>
-  </section>
-
-  <section class="panel">
-    <h2>Event log</h2>
-    <div id="event-log-body" class="panel-body mono"></div>
-  </section>
+    <section class="panel device-panel">
+      <h2>Phone data</h2>
+      <div id="device-body" class="device-body"></div>
+    </section>
+  </div>
 </main>
 
 <footer>
-  <form id="inject-form" style="display:flex; flex:1; gap:8px;">
+  <form id="inject-form">
     <input id="inject-text" type="text" autocomplete="off"
-           placeholder="Type an utterance and press Enter (works even if mic/TTS is unavailable)" />
+           placeholder="Type instead of speaking (works even if mic/TTS is unavailable)" />
     <button type="submit">Send</button>
   </form>
+  <details id="raw-log">
+    <summary>Raw events</summary>
+    <div id="event-log-body"></div>
+  </details>
 </footer>
 
 <script>
@@ -154,10 +239,10 @@ function wsUrl(path) {
 function setChip(id, text, cls) {
   const el = document.getElementById(id);
   el.textContent = text;
-  el.className = "status-chip" + (cls ? " " + cls : "");
+  el.className = cls ? cls : "";
 }
 
-// --- event log ---------------------------------------------------------------
+// --- raw event log: collapsed developer detail, off by default -----------------
 
 const eventLines = [];
 
@@ -167,12 +252,12 @@ function appendEventLog(msg) {
   if (eventLines.length > 400) eventLines.shift();
   const el = document.getElementById("event-log-body");
   el.textContent = eventLines.join("\n");
-  el.scrollTop = el.scrollHeight;
+  if (document.getElementById("raw-log").open) el.scrollTop = el.scrollHeight;
 }
 
 // --- transcript ---------------------------------------------------------------
 //
-// Built from the SAME event stream the log panel shows, not re-derived audio:
+// Built from the SAME event stream the raw log shows, not re-derived audio:
 //   to_reasoner        -> what the user said (post silence-timeout / merge-window,
 //                          i.e. the text the reasoner actually acted on)
 //   concierge_act       -> what the assistant said, when the concierge is on
@@ -223,11 +308,15 @@ function handleTranscriptEvent(msg) {
 
 function renderTranscript() {
   const el = document.getElementById("transcript-body");
+  if (!transcript.length) {
+    el.innerHTML = '<div class="empty">Say something to get started.</div>';
+    return;
+  }
   el.innerHTML = transcript.map((t) => {
     const label = t.role === "user" ? "You" : "Assistant";
-    const cls = t.role === "user" ? "msg-user" : "msg-assistant";
-    const suffix = t.silent ? ' <span class="silent-tag">(no audio — TTS unavailable)</span>' : "";
-    return `<div class="${cls}"><b>${label}:</b> ${escapeHtml(t.text)}${suffix}</div>`;
+    const suffix = t.silent ? '<span class="silent-tag">(no audio — TTS unavailable)</span>' : "";
+    return `<div class="turn ${t.role}"><span class="who">${label}</span>` +
+      `<span class="bubble">${escapeHtml(t.text)}</span>${suffix}</div>`;
   }).join("");
   el.scrollTop = el.scrollHeight;
 }
@@ -235,9 +324,9 @@ function renderTranscript() {
 // --- events websocket ----------------------------------------------------------
 
 function connectEvents() {
-  setChip("chip-events", "events: connecting", "");
+  setChip("chip-events", "events connecting…", "");
   const ws = new WebSocket(wsUrl("/events"));
-  ws.onopen = () => setChip("chip-events", "events: live", "on");
+  ws.onopen = () => setChip("chip-events", "events live", "");
   ws.onmessage = (ev) => {
     let msg;
     try { msg = JSON.parse(ev.data); } catch (e) { return; }
@@ -245,7 +334,7 @@ function connectEvents() {
     handleTranscriptEvent(msg);
   };
   ws.onclose = () => {
-    setChip("chip-events", "events: reconnecting…", "bad");
+    setChip("chip-events", "events reconnecting…", "bad");
     setTimeout(connectEvents, 1000);
   };
   ws.onerror = () => ws.close();
@@ -258,43 +347,79 @@ function connectEvents() {
 // re-derived independently from the event stream. It is still "live" -- just
 // on a ~500ms poll instead of push -- and is far less code to get right before
 // tonight than reconstructing task rows from from_reasoner events by hand.
+//
+// A task/row's "just changed" highlight is tracked by wall-clock timestamp
+// rather than "did it change on THIS poll", so it stays visible for a fixed
+// window regardless of poll timing -- otherwise a change could get replaced
+// by an un-flashed re-render within a single 500ms tick.
+
+const HIGHLIGHT_MS = 4000;
+
+const PLAIN_STATUS = {
+  pending: "Queued",
+  running: "Working on it…",
+  awaiting_confirm: "Needs your OK",
+  done: "Done",
+  failed: "Didn't work",
+  cancelled: "Cancelled",
+};
+
+const TASK_RANK = { awaiting_confirm: 0, running: 1, pending: 2, done: 3, failed: 3, cancelled: 3 };
 
 const lastTaskStatus = {};
+const taskChangedAt = {};
 let firstStatePoll = true;
 
-function statusClass(status) {
-  return "status-" + String(status || "").toLowerCase();
+function plainStatus(status) {
+  return PLAIN_STATUS[status] || (status ? status[0].toUpperCase() + status.slice(1) : "");
 }
 
 function renderTasks(tasks) {
   const el = document.getElementById("tasks-body");
   if (!tasks.length) {
-    el.innerHTML = '<div class="empty">(none yet)</div>';
+    el.innerHTML = '<div class="empty">Nothing yet.</div>';
     return;
   }
-  const rows = tasks.map((t) => {
-    const changed = !firstStatePoll && lastTaskStatus[t.task_id] !== undefined
-      && lastTaskStatus[t.task_id] !== t.status;
+  const now = Date.now();
+  const ordered = tasks.map((t, i) => ({ t, i })).sort((a, b) => {
+    const ra = TASK_RANK[a.t.status] ?? 2, rb = TASK_RANK[b.t.status] ?? 2;
+    return ra !== rb ? ra - rb : a.i - b.i;
+  });
+  const cards = ordered.map(({ t }) => {
+    if (!firstStatePoll && lastTaskStatus[t.task_id] !== undefined && lastTaskStatus[t.task_id] !== t.status) {
+      taskChangedAt[t.task_id] = now;
+    }
     lastTaskStatus[t.task_id] = t.status;
-    const cls = statusClass(t.status) + (changed ? " flash" : "");
-    return `<tr class="${cls}"><td>${escapeHtml(t.task_id)}</td>` +
-      `<td>${escapeHtml(t.understood_as)}</td>` +
-      `<td>${escapeHtml(t.status)}</td>` +
-      `<td>${escapeHtml(t.detail)}</td></tr>`;
+    const recentlyChanged = (now - (taskChangedAt[t.task_id] || 0)) < HIGHLIGHT_MS;
+    const needsConfirm = t.status === "awaiting_confirm";
+    const cls = ["task-card", "status-" + String(t.status || "").toLowerCase()];
+    if (needsConfirm) cls.push("needs-confirm");
+    else if (recentlyChanged) cls.push("flash");
+    return `<div class="${cls.join(" ")}">` +
+      `<div class="task-what">${escapeHtml(t.understood_as)}</div>` +
+      `<div class="task-status">${escapeHtml(plainStatus(t.status))}</div>` +
+      (t.detail ? `<div class="task-detail">${escapeHtml(t.detail)}</div>` : "") +
+      `</div>`;
   }).join("");
-  el.innerHTML = `<table><thead><tr><th>id</th><th>understood as</th><th>status</th><th>detail</th></tr></thead>` +
-    `<tbody>${rows}</tbody></table>`;
+  el.innerHTML = cards;
 }
 
 let lastDeviceRows = {};
+const deviceChangedAt = {};
+
+function capitalize(s) {
+  return s ? s[0].toUpperCase() + s.slice(1) : s;
+}
 
 function renderDevice(device) {
   const el = document.getElementById("device-body");
   const nextRows = {};
+  const now = Date.now();
   let html = "";
   for (const [table, rows] of Object.entries(device)) {
     nextRows[table] = {};
-    html += `<div class="device-table"><h4>${escapeHtml(table)}</h4>`;
+    deviceChangedAt[table] = deviceChangedAt[table] || {};
+    html += `<div class="device-table"><h4>${escapeHtml(capitalize(table))}</h4>`;
     if (!Array.isArray(rows) || rows.length === 0) {
       html += `<div class="empty">(empty)</div></div>`;
       continue;
@@ -305,8 +430,11 @@ function renderDevice(device) {
       const key = row.id !== undefined ? String(row.id) : JSON.stringify(row);
       const json = JSON.stringify(row);
       nextRows[table][key] = json;
-      const changed = !firstStatePoll && prevTable[key] !== undefined && prevTable[key] !== json;
-      const cls = changed ? "flash" : "";
+      if (!firstStatePoll && prevTable[key] !== undefined && prevTable[key] !== json) {
+        deviceChangedAt[table][key] = now;
+      }
+      const recentlyChanged = (now - (deviceChangedAt[table][key] || 0)) < HIGHLIGHT_MS;
+      const cls = recentlyChanged ? "row-changed" : "";
       const tds = cols.map((c) => `<td>${escapeHtml(row[c])}</td>`).join("");
       return `<tr class="${cls}">${tds}</tr>`;
     }).join("");
@@ -317,6 +445,16 @@ function renderDevice(device) {
   lastDeviceRows = nextRows;
 }
 
+function renderWaitingBanner(data) {
+  const el = document.getElementById("waiting-banner");
+  if (data.pending_question) {
+    el.textContent = "Waiting for your answer: " + data.pending_question;
+    el.classList.add("show");
+  } else {
+    el.classList.remove("show");
+  }
+}
+
 async function pollState() {
   try {
     const res = await fetch("/state");
@@ -324,14 +462,11 @@ async function pollState() {
     const data = await res.json();
     renderTasks(data.tasks || []);
     renderDevice(data.device || {});
-    if (data.speaking) {
-      setChip("chip-speaking", "speaking…", "speaking");
-    } else if (data.pending_question) {
-      setChip("chip-speaking", "awaiting: " + data.pending_question, "speaking");
-    } else {
-      setChip("chip-speaking", "idle", "");
-    }
+    renderWaitingBanner(data);
     firstStatePoll = false;
+    // Keep highlight windows re-rendering even without underlying data
+    // changes, so the flash actually fades out on screen instead of
+    // sticking until the next real change.
   } catch (e) {
     // server not reachable yet; try again on the next tick
   }
@@ -470,9 +605,9 @@ async function start() {
   nextPlaybackTime = 0;
   audioWs = new WebSocket(wsUrl("/audio"));
   audioWs.binaryType = "arraybuffer";
-  audioWs.onopen = () => setChip("chip-audio", "audio: live", "on");
+  audioWs.onopen = () => setChip("chip-audio", "audio live", "");
   audioWs.onmessage = (ev) => playback(ev.data);
-  audioWs.onclose = () => { if (running) setChip("chip-audio", "audio: disconnected", "bad"); };
+  audioWs.onclose = () => { if (running) setChip("chip-audio", "audio disconnected", "bad"); };
 
   if (audioCtx.audioWorklet) {
     try {
@@ -486,7 +621,7 @@ async function start() {
   }
 
   running = true;
-  setChip("chip-mic", "mic: live", "on");
+  setChip("chip-mic", "mic live", "");
   updateButton();
 }
 
@@ -499,14 +634,14 @@ function stop() {
   try { micStream && micStream.getTracks().forEach((t) => t.stop()); } catch (e) {}
   try { audioCtx && audioCtx.close(); } catch (e) {}
   audioWs = null; audioCtx = null; sourceNode = null; captureNode = null; silentGain = null; micStream = null;
-  setChip("chip-mic", "mic: off", "");
-  setChip("chip-audio", "audio: off", "");
+  setChip("chip-mic", "mic off", "");
+  setChip("chip-audio", "audio off", "");
   updateButton();
 }
 
 function updateButton() {
   const btn = document.getElementById("btn-start-stop");
-  btn.textContent = running ? "Stop" : "Start";
+  btn.textContent = running ? "Stop listening" : "Start listening";
   btn.classList.toggle("running", running);
 }
 
