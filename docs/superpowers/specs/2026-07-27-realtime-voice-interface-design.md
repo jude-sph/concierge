@@ -145,10 +145,25 @@ reads and writes it, so "set all contacts to Hans" is verifiable by diffing a fi
 {"state": "user_complete", "transcript_delta": "...", "chunk": 1247}
 ```
 
-States are SoulX-Duplug's five: `user_idle`, `user_nonidle`, `user_backchannel`,
+States are the five domain states `user_idle`, `user_nonidle`, `user_backchannel`,
 `user_complete`, `user_incomplete`. Plus lifecycle events `speaking_started` and
 `speaking_finished(utterance_id)` so the orchestrator knows whether a barge-in actually cut
 something off.
+
+**These are derived, not served directly.** SoulX-Duplug's shipped WebSocket API emits four
+wire states — `idle`, `nonidle`, `speak`, `blank` — so an adapter in voice-service maps them:
+
+| Wire | Domain | Derivation |
+|---|---|---|
+| `blank` | *(none)* | Insufficient audio buffered; emit no domain event |
+| `idle` | `user_idle` | Direct |
+| `nonidle` | `user_nonidle` | Direct |
+| `speak` | `user_complete` | Direct, unless the transcript is a backchannel |
+| `speak` + backchannel text | `user_backchannel` | Via the repo's `utils.backchannel_utils.check_backchannel()` |
+| — | `user_incomplete` | **Inferred**: `nonidle` → `idle` with no intervening `speak`. The model declining to take the turn *is* the incompleteness signal |
+
+The wire protocol is JSON text frames carrying base64-encoded **float32** PCM at 16 kHz, one
+response per request. Adapter logic is pure and unit-testable without the model.
 
 ### orchestrator → voice-service
 
