@@ -586,8 +586,36 @@ def create_app(orch: Orchestrator) -> "FastAPI":
     return app
 
 
+def _build_reasoner(device):
+    """Which reasoner this process runs, from the environment.
+
+    REASONER=llm selects the model-driven one, which needs an OpenAI-compatible
+    endpoint (REASONER_URL, falling back to the concierge's). Anything else --
+    including unset -- keeps the rule-based stub, so offline use and the test
+    suite are unaffected by this switch existing.
+    """
+    import os
+
+    latency_ms = int(os.environ.get("REASONER_LATENCY_MS", "0"))
+    if os.environ.get("REASONER", "").strip().lower() == "llm":
+        from .llm_reasoner import LlmReasoner
+
+        return LlmReasoner(
+            device,
+            base_url=os.environ.get(
+                "REASONER_URL",
+                os.environ.get("CONCIERGE_URL", "http://localhost:8001/v1")),
+            model=os.environ.get("REASONER_MODEL", "Qwen/Qwen3-4B"),
+            latency_ms=latency_ms,
+        )
+
+    from .reasoner_stub import ReasonerStub
+
+    return ReasonerStub(device, latency_ms=latency_ms)
+
+
 def build_default_orchestrator(session_dir=None) -> Orchestrator:
-    """The standard wiring: journaled device, stub reasoner, real concierge.
+    """The standard wiring: journaled device, a reasoner, real concierge.
 
     Shared by the HTTP app and by tools/audio_client.py so there is one
     definition of "the system", not two that drift.
@@ -597,7 +625,6 @@ def build_default_orchestrator(session_dir=None) -> Orchestrator:
 
     from .concierge import Concierge
     from .device import DeviceState
-    from .reasoner_stub import ReasonerStub
     from .voice_service import VoiceService
 
     session = Path(session_dir) if session_dir is not None else (
@@ -613,7 +640,7 @@ def build_default_orchestrator(session_dir=None) -> Orchestrator:
     # does not require. Set USE_CONCIERGE=1 to turn it on once that's running.
     use_concierge = os.environ.get("USE_CONCIERGE", "0").strip().lower() in ("1", "true", "yes")
     return Orchestrator(
-        reasoner=ReasonerStub(device, latency_ms=int(os.environ.get("REASONER_LATENCY_MS", "0"))),
+        reasoner=_build_reasoner(device),
         concierge=concierge, voice=voice, log=log, device=device,
         use_concierge=use_concierge,
     )
