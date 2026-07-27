@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import re
+from typing import Literal
 
 from fastapi import FastAPI
 
@@ -46,6 +47,41 @@ _AFFIRMATIVE_RE = _vocab_re(AFFIRMATIVE_WORDS, AFFIRMATIVE_PHRASES)
 _SPLIT = re.compile(r"\s+and\s+(?=(?:find|get|set|change|rename|book|text|call|delete|add|search)\b)")
 _RENAME = re.compile(r"(?:set|change|rename)\s+(?:all\s+)?(?:my\s+)?contacts?.*?to\s+(\w+)", re.I)
 _SEARCH = re.compile(r"(?:find|search for)\s+(.+)", re.I)
+
+ConfirmVerdict = Literal["not_an_answer", "declined", "confirmed"]
+
+
+def confirmation_decision(answer: str) -> ConfirmVerdict:
+    """May this utterance resolve a pending destructive write, and how?
+
+    Three gates, in this order. This function is the ONLY implementation of
+    them in the system; every reasoner imports it rather than restating it,
+    because the ordering *is* the safety property and two copies of it would
+    eventually disagree.
+
+    Gate 1 -- is this an ANSWER at all? Only an utterance that is essentially
+    just a yes/no may resolve a pending destructive write. A sentence carrying
+    its own new request is not an answer no matter what words it happens to
+    contain, and must leave the question open rather than being read as either
+    assent or a decline. (Before this gate, "okay so what's on my calendar
+    tomorrow" renamed every contact on the device.) The caller must leave its
+    pending task untouched on "not_an_answer": the task stays AWAITING_CONFIRM
+    and remains answerable.
+
+    Gate 2 -- default-deny: negations are checked first, regardless of any
+    affirmative words also present ("don't do it", "that is not okay",
+    "no, don't confirm it").
+
+    Gate 3 -- only an explicit affirmative commits. Anything ambiguous ("hmm")
+    declines.
+    """
+    if not is_answer_shaped(answer):
+        return "not_an_answer"
+    if _NEGATION_RE.search(answer):
+        return "declined"
+    if not _AFFIRMATIVE_RE.search(answer):
+        return "declined"
+    return "confirmed"
 
 
 class ReasonerStub:
@@ -123,31 +159,17 @@ class ReasonerStub:
         if plan is None:
             return [ReasonerMessage(kind="noop")]
 
-        # Gate 1 -- is this an ANSWER at all? Only an utterance that is
-        # essentially just a yes/no may resolve a pending destructive write.
-        # A sentence carrying its own new request is not an answer no matter
-        # what words it happens to contain, and must leave the question open
-        # rather than being read as either assent or a decline. (Before this
-        # gate, "okay so what's on my calendar tomorrow" renamed every
-        # contact on the device.) Leaving `_pending` untouched is the point:
-        # the task stays AWAITING_CONFIRM and remains answerable.
-        if not is_answer_shaped(answer):
+        # The three gates live in confirmation_decision() above, so this
+        # reasoner and the LLM one cannot drift apart on the one question that
+        # matters. "not_an_answer" leaves `_pending` untouched on purpose: the
+        # task stays AWAITING_CONFIRM and remains answerable.
+        verdict = confirmation_decision(answer)
+        if verdict == "not_an_answer":
             return [ReasonerMessage(kind="noop")]
 
         self._pending.pop(key, None)
 
-        # Gate 2 -- default-deny: negations are checked first, regardless of
-        # any affirmative words also present ("don't do it", "that is not
-        # okay", "no, don't confirm it").
-        if _NEGATION_RE.search(answer):
-            self.device.rollback()
-            self._tokens.pop(task_id, None)
-            self.tokens.pop(task_id, None)
-            return [ReasonerMessage(kind="failed", task_id=task_id, reason="cancelled by user")]
-
-        # Gate 3 -- only an explicit affirmative commits. Anything ambiguous
-        # ("hmm") declines.
-        if not _AFFIRMATIVE_RE.search(answer):
+        if verdict != "confirmed":
             self.device.rollback()
             self._tokens.pop(task_id, None)
             self.tokens.pop(task_id, None)
