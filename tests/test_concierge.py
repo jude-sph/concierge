@@ -76,6 +76,30 @@ def test_relay_citing_pending_task_requires_fact():
     assert "fact recorded yet" in err or "no fact" in err
 
 
+def test_bare_placeholder_text_is_rejected():
+    """The live-session failure: the model copied the '{"text": "..."}'
+    template slot straight out of the format spec, and it was spoken aloud
+    verbatim as literal dots. A bare placeholder must never pass validation,
+    for any act."""
+    ok, err = validate_act(SpeechAct(act="acknowledge", text="..."), TaskRegistry())
+    assert not ok
+    assert "placeholder" in err
+
+
+def test_placeholder_variants_are_rejected():
+    for text in ["...", "…", "....", "[...]", "<...>", "  ...  "]:
+        ok, _ = validate_act(SpeechAct(act="chat", text=text), TaskRegistry())
+        assert not ok, f"{text!r} should have been rejected as a placeholder"
+
+
+def test_a_real_sentence_that_happens_to_end_in_an_ellipsis_is_fine():
+    """Only a BARE placeholder is rejected -- an ellipsis used as ordinary
+    punctuation inside a real sentence must not be caught by the same net."""
+    ok, _ = validate_act(SpeechAct(act="chat", text="hold on, let me check..."),
+                         TaskRegistry())
+    assert ok
+
+
 def test_relay_citing_running_task_requires_fact():
     """A relay citing a task that is only progress'd (RUNNING) has no fact to relay yet."""
     r = TaskRegistry()

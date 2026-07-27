@@ -8,6 +8,7 @@ Three structural measures replace any inspection of generated prose:
 from __future__ import annotations
 
 import json
+import re
 from typing import Literal, Optional
 
 import httpx
@@ -15,26 +16,38 @@ from pydantic import BaseModel
 
 from .registry import TaskRegistry
 
-SYSTEM_PROMPT = """You are the voice of an assistant that controls a phone.
+SYSTEM_PROMPT = """You are the spoken voice of a phone assistant.
 
-A separate reasoning system does all the actual work and owns all facts about
-the phone. You own the conversation.
+A separate reasoning system does the real work and owns every fact about the
+phone. You own only the conversation.
 
 RULES:
-- You may ONLY state task facts that appear in the CURRENT TASKS block below.
-- When reporting a result, use act="relay", cite the task id, and include the
-  exact wording given for that task verbatim. You may add conversational
-  framing around it, but never reword the fact itself.
-- If you do not know something, say so. Never guess at task status.
-- Keep replies short and natural - they will be spoken aloud.
+- State a task fact ONLY if it appears in CURRENT TASKS below.
+- To report a result: act="relay", cite the task id, and include that task's
+  exact wording verbatim. Frame it however you like, never reword the fact.
+- Don't know something? Say so - never guess at task status.
+- Every reply is spoken aloud: one short, natural sentence. NEVER output a
+  placeholder like "..." - that gets read aloud literally. Write a real
+  sentence, or empty text if there is truly nothing worth saying.
+- Trigger "user_turn": acknowledge right away, even before results exist.
+- Trigger "reasoner_update": speak only if there's something worth relaying,
+  asking, or aborting - otherwise reply with empty text.
 
 Reply with a single JSON object and nothing else:
-  {"act": "acknowledge", "text": "..."}   brief filler while work happens
-  {"act": "relay", "cites": "<task_id>", "text": "..."}  report a result
-  {"act": "ask", "text": "..."}           ask the user something
-  {"act": "abort", "cites": "<task_id>"}  user clearly wants a currently-active task stopped
-  {"act": "chat", "text": "..."}          ordinary conversation
+  {"act": "acknowledge", "text": "On it."}
+  {"act": "relay", "cites": "t1", "text": "Found it - renamed 47 contacts."}
+  {"act": "ask", "text": "Which one did you mean?"}
+  {"act": "abort", "cites": "t1"}
+  {"act": "chat", "text": "Sure, what else?"}
 """
+
+# A reply that is nothing but an unfilled template slot - the model copying
+# "..." (or a bracketed placeholder) straight out of the format spec above
+# instead of writing a real sentence. Caught here, not just warned against in
+# the prompt, because "the model was told not to" is not a guarantee: this
+# is exactly the failure a live session produced. Matches the WHOLE reply
+# (not e.g. a trailing ellipsis inside real prose like "hold on...").
+_PLACEHOLDER_RE = re.compile(r"^(\.{2,}|…|\[[.\s…]*\]|<[.\s…]*>)$")
 
 SPEECH_ACT_SCHEMA = {
     "type": "object",
@@ -54,7 +67,14 @@ class SpeechAct(BaseModel):
 
 
 def validate_act(act: SpeechAct, registry: TaskRegistry) -> tuple[bool, str]:
-    """Schema-level check on typed fields. Never inspects natural language."""
+    """Schema-level check on typed fields, plus one narrow structural check on
+    the text: is it a real sentence, or an unfilled placeholder copied from
+    the format spec? That is a shape check ("is this a template slot"), not an
+    inspection of what the sentence claims - facts are still policed only via
+    the relay/cites/verbatim-span checks below.
+    """
+    if act.text and _PLACEHOLDER_RE.match(act.text.strip()):
+        return False, f"reply text is a placeholder, not a real sentence: {act.text!r}"
     if act.act == "relay":
         if not act.cites:
             return False, "relay requires cites"
@@ -97,7 +117,12 @@ class Concierge:
             json={
                 "model": self.model,
                 "messages": messages,
-                "max_tokens": 200,
+                # One short spoken sentence plus a little JSON scaffolding
+                # (act/cites/text) - even the longest verbatim span this ever
+                # has to carry (an unfiltered-delete confirmation) fits with
+                # room to spare. Kept well under the old 200 so a slow model
+                # can't burn the turn's latency budget on an oversized reply.
+                "max_tokens": 100,
                 "temperature": 0.6,
                 "guided_json": SPEECH_ACT_SCHEMA,
             },

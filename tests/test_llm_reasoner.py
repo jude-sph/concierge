@@ -283,6 +283,32 @@ async def test_scoped_search_over_places(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_a_single_match_reads_as_a_sentence_not_a_record_dump(tmp_path):
+    """The live-session failure: 'found 1 match in places: Golden Lotus
+    chinese Soho 4.5 False' is a raw row dump read aloud, and the trailing
+    'False' is the saved flag. A person must hear field names, not a
+    positional list of values, and a false boolean -- meaningless spoken --
+    must not be said at all. The internal id must never be spoken either."""
+    reasoner, _ = build(tmp_path, plan({
+        "operation": "query", "table": "places",
+        "where": {"name": "Golden Lotus"},
+        "understood_as": "look up Golden Lotus",
+    }))
+
+    out = await say(reasoner, 'what type of cuisine is golden lotus')
+    result = only(out, "done").result
+
+    assert "1 match in places" in result
+    # fields are named in words, not silently concatenated
+    assert "cuisine chinese" in result
+    assert "area Soho" in result
+    assert "rating 4.5" in result
+    # the internal id and the false "saved" flag carry nothing spoken aloud
+    assert "id" not in result
+    assert "False" not in result and "false" not in result
+
+
+@pytest.mark.asyncio
 async def test_conversational_input_produces_no_task(tmp_path):
     reasoner, _ = build(tmp_path, plan({"operation": "none",
                                         "understood_as": "small talk"}))
@@ -421,7 +447,8 @@ async def test_insert(tmp_path):
 
     done = await answer(reasoner, only(out, "confirm_required").task_id, "yes")
     assert only(done, "done").result == (
-        "added 1 row to calendar: reminder 2026-07-28 2026-07-28T09:00")
+        "added 1 row to calendar: title reminder, day 2026-07-28, "
+        "when 2026-07-28T09:00")
     assert ids(reasoner, "calendar") == [1, 2, 3, 4]
     assert reasoner.device.query("calendar", {"id": 4})[0]["title"] == "reminder"
 

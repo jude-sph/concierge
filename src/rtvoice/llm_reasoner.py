@@ -301,20 +301,69 @@ def _scope(table: str, where: dict | None, n: int) -> str:
     return f"{n} {_rows_word(n)} in {table} where {_describe_where(where)}"
 
 
+def _spoken(value: Any) -> str:
+    """Like `_fmt`, but for text that is read aloud rather than echoed as a
+    quoted literal: a spoken sentence has no use for JSON-style quote marks
+    or Python's capitalised bool repr.
+    """
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _speakable_fields(row: dict) -> dict:
+    """The fields of `row` worth saying aloud, in the device's own order.
+
+    Three kinds of field are dropped, because saying them adds noise, not
+    information: the internal id (never meaningful spoken - "id 4" identifies
+    nothing a listener can use); anything empty; and a *false* boolean, which
+    is a field's silent default state, not an event worth reporting ("saved
+    false" reads like a fourth fact about the place when it is really the
+    absence of one). A *true* boolean is kept - "read true" / "saved true" is
+    exactly the positive fact a person would ask about.
+    """
+    out = {}
+    for k, v in row.items():
+        if k == "id" or v is None or v == "" or v == []:
+            continue
+        if isinstance(v, bool) and not v:
+            continue
+        out[k] = v
+    return out
+
+
 def _row_summary(row: dict) -> str:
-    return " ".join(
-        str(v) for k, v in row.items()
-        if k != "id" and v not in (None, "", [])
-    )
+    """One row, read as a short spoken clause: field names in words ("cuisine
+    chinese"), not a silent positional dump ("chinese") that only makes sense
+    if you already know the column order.
+    """
+    fields = _speakable_fields(row)
+    return ", ".join(f"{k} {_spoken(v)}" for k, v in fields.items())
+
+
+def _row_headline(row: dict) -> str:
+    """Just enough to pick this row out of a list of several - its first
+    speakable value (typically a name or title), not every column. Reading
+    every field of every match is a table read aloud one cell at a time;
+    naming the first few by their headline value and saying how many there
+    are is what a person would actually say.
+    """
+    fields = _speakable_fields(row)
+    if not fields:
+        return "a row"
+    return _spoken(next(iter(fields.values())))
 
 
 def _describe_hits(table: str, rows: list[dict]) -> str:
     n = len(rows)
     if n == 0:
         return f"no matches in {table}"
-    head = "; ".join(_row_summary(r) for r in rows[:3])
     word = "match" if n == 1 else "matches"
-    more = f" and {n - 3} more" if n > 3 else ""
+    if n == 1:
+        # A single hit is short enough to say in full.
+        return f"{n} {word} in {table}: {_row_summary(rows[0])}"
+    head = ", ".join(_row_headline(r) for r in rows[:3])
+    more = f", and {n - 3} more" if n > 3 else ""
     return f"{n} {word} in {table}: {head}{more}"
 
 
@@ -436,7 +485,12 @@ class LlmReasoner:
             json={
                 "model": self.model,
                 "messages": messages,
-                "max_tokens": 400,
+                # A plan is compact JSON, not prose: even a compound plan of
+                # several intents (each with a short "where"/"values" and a
+                # one-line "understood_as") comfortably fits in a fraction of
+                # the old 400 -- and a lower ceiling caps how much latency one
+                # slow generation can spend before the reasoner even starts.
+                "max_tokens": 250,
                 # Planning is structured extraction, not conversation -- there
                 # is one right answer per utterance, so less sampling noise
                 # is strictly better here than in Concierge's spoken replies.
