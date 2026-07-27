@@ -1192,6 +1192,14 @@ class TaskRegistry:
             self._tasks[tid] = Task(task_id=tid, understood_as=msg.understood_as)
 
         task = self._tasks[tid]
+
+        # Terminal states never regress. The transport is unordered and the
+        # orchestrator fires some messages without awaiting, so a stale
+        # `progress` after `done` would otherwise flip a finished task back to
+        # running and drop its result text - which the concierge then reports.
+        if task.status in TERMINAL:
+            return
+
         task.updated_ms = int(time.monotonic() * 1000)
 
         if msg.kind == "ack":
@@ -1217,8 +1225,9 @@ class TaskRegistry:
             self._verbatim[tid] = msg.reason
 
     def mark_cancelled(self, task_id: str) -> None:
-        if task_id in self._tasks:
-            self._tasks[task_id].status = TaskStatus.CANCELLED
+        task = self._tasks.get(task_id)
+        if task is not None and task.status not in TERMINAL:
+            task.status = TaskStatus.CANCELLED
 
     def get(self, task_id: str) -> Task | None:
         return self._tasks.get(task_id)
