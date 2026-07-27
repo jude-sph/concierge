@@ -90,11 +90,55 @@ RULES:
   person, filter to that person. If a later clause narrows an earlier one
   ("delete yesterday's messages, just the ones from Marcus"), plan ONE intent
   with BOTH filters.
+- In an update, "where" and "values" answer different questions: "where" is
+  WHICH rows to find, described by their CURRENT values; "values" is what to
+  set on them. A new value must NEVER appear in "where" - if it does, the
+  update will match nothing, because the row does not have the new value yet.
 - NEVER count anything, and never say how many records are affected. You do
   not know, and the system computes it itself from the device.
 - If you cannot tell what was meant, use "none". Do not guess at a write.
 
-Reply with a single JSON object and nothing else:
+EXAMPLES (table names and dates below are illustrative, not the real device):
+
+  "rename Priya to Jude Hawrani" ->
+  {"intents": [{"operation": "update", "table": "contacts",
+    "where": {"first_name": "Priya"},
+    "values": {"first_name": "Jude", "last_name": "Hawrani"},
+    "understood_as": "rename Priya to Jude Hawrani"}]}
+  Note: "where" is Priya's CURRENT name. "Jude" and "Hawrani" are the NEW
+  values and appear ONLY in "values", never in "where".
+
+  "change my work contacts to Hans" ->
+  {"intents": [{"operation": "update", "table": "contacts",
+    "where": {"group": "work"}, "values": {"first_name": "Hans"},
+    "understood_as": "rename work contacts to Hans"}]}
+
+  "what's in my calendar tomorrow" ->
+  {"intents": [{"operation": "query", "table": "calendar",
+    "where": {"day": "2026-07-28"},
+    "understood_as": "look up tomorrow's calendar"}]}
+
+  "delete yesterday's messages from Marcus" ->
+  {"intents": [{"operation": "delete", "table": "messages",
+    "where": {"sent": "2026-07-26", "contact": "Marcus Webb"},
+    "understood_as": "delete yesterday's messages from Marcus"}]}
+
+  "add a dentist appointment tomorrow at 4:30pm" ->
+  {"intents": [{"operation": "insert", "table": "calendar",
+    "values": {"title": "dentist", "day": "2026-07-28", "when": "2026-07-28T16:30"},
+    "understood_as": "add a dentist appointment tomorrow"}]}
+
+  "book a table for four and text Sarah about it" ->
+  {"intents": [
+    {"operation": "insert", "table": "calendar",
+     "values": {"title": "table for four", "day": "2026-07-28"},
+     "understood_as": "book a table for four"},
+    {"operation": "insert", "table": "messages",
+     "values": {"contact": "Sarah Chen", "body": "table booked for four"},
+     "understood_as": "text Sarah about the table"}]}
+
+Reply with a single JSON object and nothing else, shaped exactly like the
+examples above:
 {"intents": [{"operation": "query|update|delete|insert|unsupported|none",
               "table": "<table or null>",
               "where": {"<field>": "<value>"} or null,
@@ -137,6 +181,51 @@ class Intent(BaseModel):
 
 class Plan(BaseModel):
     intents: list[Intent] = []
+
+
+def _extract_json(content: str) -> Any:
+    """Parse `content` as JSON, tolerating prose or markdown fences around the
+    object it contains.
+
+    A real model does not reliably emit a bare JSON object even when told
+    to -- "Sure, here's the plan:\\n```json\\n{...}\\n```" is a JSONDecodeError
+    under a plain `json.loads`, even though the object itself is well-formed.
+    So on a first-pass failure, this scans for the first balanced `{...}`
+    (quote-aware, so a brace inside a string value cannot desync the count)
+    and parses that instead. If no such object exists, the original
+    JSONDecodeError propagates -- there is nothing here worth guessing at.
+    """
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        pass
+
+    start = content.find("{")
+    if start == -1:
+        return json.loads(content)  # re-raise the original error
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(content)):
+        ch = content[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return json.loads(content[start:i + 1])
+    return json.loads(content)  # unbalanced -- re-raise the original error
 
 
 # --- rendering ---------------------------------------------------------------
@@ -310,8 +399,47 @@ class LlmReasoner:
 
     # --- the model call ------------------------------------------------------
 
+    async def _post(self, messages: list[dict]) -> str:
+        """One HTTP round trip. Transport failures (unreachable, timeout,
+        non-2xx) propagate uncaught -- those are not retried; see `_complete`.
+        """
+        resp = await self._client.post(
+            f"{self.base_url}/chat/completions",
+            json={
+                "model": self.model,
+                "messages": messages,
+                "max_tokens": 400,
+                # Planning is structured extraction, not conversation -- there
+                # is one right answer per utterance, so less sampling noise
+                # is strictly better here than in Concierge's spoken replies.
+                "temperature": 0.0,
+                "guided_json": PLAN_SCHEMA,
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
+    @staticmethod
+    def _to_plan(content: str) -> tuple[Optional[Plan], str]:
+        """The plan, or "" as an error message if `content` could not be
+        read as one -- not JSON at all, or JSON that does not fit the
+        schema (Plan(**data) also rejects e.g. a bare list or a string)."""
+        try:
+            return Plan(**_extract_json(content)), ""
+        except Exception as exc:
+            return None, str(exc)
+
     async def _complete(self, text: str) -> Plan:
-        """One plan, or an exception. Never a partial or repaired plan."""
+        """One plan. Retries once on a parse or schema failure -- following
+        the same shape as `Concierge.respond`: the error is appended to the
+        conversation so the model can see what it did wrong and try again.
+        A transport failure (see `_post`) is not caught here and is never
+        retried; only the model's own malformed output is.
+
+        If both attempts fail, the second error is raised, and the caller
+        (`_plan`) treats it exactly like an unreachable model: nothing
+        written, a `failed` message, `misreads` counted once.
+        """
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "system", "content": f"DEVICE SCHEMA:\n{self.schema_block()}"},
@@ -319,19 +447,20 @@ class LlmReasoner:
             *self._history[-self.history_turns:],
             {"role": "user", "content": text},
         ]
-        resp = await self._client.post(
-            f"{self.base_url}/chat/completions",
-            json={
-                "model": self.model,
-                "messages": messages,
-                "max_tokens": 400,
-                "temperature": 0.2,
-                "guided_json": PLAN_SCHEMA,
-            },
-        )
-        resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"]
-        return Plan(**json.loads(content))
+
+        content = await self._post(messages)
+        plan, err = self._to_plan(content)
+        if plan is not None:
+            return plan
+
+        messages.append({"role": "system", "content":
+                          f"That reply could not be read as a plan ({err}). "
+                          "Reply with a single JSON object and nothing else."})
+        content = await self._post(messages)
+        plan, err = self._to_plan(content)
+        if plan is not None:
+            return plan
+        raise ValueError(f"invalid plan after retry: {err}")
 
     # --- protocol ------------------------------------------------------------
 

@@ -669,6 +669,62 @@ async def test_malformed_llm_output_is_always_audible(tmp_path, payload):
     assert "failed" in kinds(out) or kinds(out) == ["noop"]
 
 
+# --- parsing resilience: prose/fences tolerated, one retry, then fail safe ---
+
+
+@pytest.mark.asyncio
+async def test_prose_wrapped_json_is_parsed_and_executed(tmp_path):
+    """A real model narrating around its own JSON ("Sure, here you go:\n```json
+    \n{...}\n```\nHope that helps!") is not unreadable -- the object inside is
+    well-formed and must be extracted and executed on the FIRST attempt, with
+    no retry needed."""
+    payload = (
+        "Sure, here is the plan:\n```json\n"
+        + json.dumps(plan({
+            "operation": "query", "table": "calendar", "where": {"day": TOMORROW},
+        }))
+        + "\n```\nHope that helps!"
+    )
+    reasoner, fake = build(tmp_path, payload)
+
+    out = await say(reasoner, "what's in my calendar tomorrow")
+
+    assert kinds(out) == ["ack", "done"]
+    assert "2 matches in calendar" in only(out, "done").result
+    assert len(fake.calls) == 1  # parsed clean the first time -- no retry needed
+
+
+@pytest.mark.asyncio
+async def test_bad_json_then_valid_json_retries_once_and_executes(tmp_path):
+    """The model stumbles once, then gets it right when told what went wrong.
+    That must not be indistinguishable from an unreadable utterance."""
+    good = plan({"operation": "query", "table": "calendar", "where": {"day": TOMORROW}})
+    reasoner, fake = build(tmp_path, "this is not json at all", good)
+
+    out = await say(reasoner, "what's in my calendar tomorrow")
+
+    assert len(fake.calls) == 2  # the retry happened
+    retry_messages = fake.calls[1]["messages"]
+    assert "could not be read as a plan" in retry_messages[-1]["content"]
+    assert kinds(out) == ["ack", "done"]
+    assert "2 matches in calendar" in only(out, "done").result
+
+
+@pytest.mark.asyncio
+async def test_bad_json_on_both_attempts_fails_safe(tmp_path):
+    """When the retry ALSO fails, the current safe behaviour holds exactly:
+    a `failed` message, nothing written -- not a crash, not a silent noop."""
+    reasoner, fake = build(tmp_path, "not json", "still not json either")
+    before = copy.deepcopy(reasoner.device.snapshot())
+
+    out = await say(reasoner, "delete all my messages")
+
+    assert len(fake.calls) == 2  # both attempts were made
+    assert kinds(out) == ["failed"]
+    assert reasoner.device.snapshot() == before
+    assert reasoner.misreads == 1
+
+
 @pytest.mark.asyncio
 async def test_a_bad_intent_does_not_kill_its_siblings(tmp_path):
     reasoner, _ = build(tmp_path, plan(
