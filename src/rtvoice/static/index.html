@@ -93,18 +93,22 @@
   .silent-tag { display: block; color: var(--warn); font-size: 12px; font-weight: 600; margin-top: 4px; }
   .empty { color: var(--fg-faint); font-style: italic; padding: 6px 20px 20px; }
 
-  /* ---------- tasks: what it's doing ---------- */
+  /* ---------- tasks: what it's doing ----------
+     Sized to its own content (flex-grow: 0) rather than a fixed split with
+     the phone-data panel below; a generous max-height is only a ceiling for
+     when several tasks are live at once, not the everyday size. The
+     phone-data panel (flex: 1 1 auto) absorbs whatever height is left over. */
 
-  .tasks-panel { flex: 0 1 auto; max-height: 52%; }
+  .tasks-panel { flex: 0 1 auto; max-height: 78%; }
   .tasks-body { flex: 1 1 auto; overflow-y: auto; padding: 4px 16px 16px; min-height: 0; }
 
   .task-card {
-    border-radius: 10px; padding: 12px 16px; margin-bottom: 10px;
+    border-radius: 10px; padding: 14px 18px; margin-bottom: 12px;
     background: var(--panel-soft); border-left: 4px solid var(--fg-faint);
   }
-  .task-card .task-what { font-size: 16px; font-weight: 600; }
-  .task-card .task-status { display: inline-block; margin-top: 6px; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--fg-dim); }
-  .task-card .task-detail { margin-top: 6px; font-size: 14px; color: var(--fg-dim); }
+  .task-card .task-what { font-size: 19px; font-weight: 600; }
+  .task-card .task-status { display: inline-block; margin-top: 8px; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--fg-dim); }
+  .task-card .task-detail { margin-top: 8px; font-size: 16px; color: var(--fg-dim); }
 
   .task-card.status-done { border-left-color: var(--good); }
   .task-card.status-done .task-status { color: var(--good); }
@@ -114,13 +118,16 @@
   .task-card.status-failed, .task-card.status-cancelled { border-left-color: var(--bad); opacity: 0.85; }
   .task-card.status-failed .task-status, .task-card.status-cancelled .task-status { color: var(--bad); }
 
+  /* The awaiting_confirm card is the one thing on screen that blocks on the
+     user, so it gets outsized type -- readable at a glance from across a
+     room -- rather than sharing the modest sizing of ordinary task cards. */
   .task-card.needs-confirm {
-    border-left: none; background: var(--warn-bg); padding: 18px 20px;
+    border-left: none; background: var(--warn-bg); padding: 26px 28px;
     animation: confirm-pulse 1.8s ease-in-out infinite;
   }
-  .task-card.needs-confirm .task-what { font-size: 19px; }
-  .task-card.needs-confirm .task-status { color: var(--warn); font-size: 13px; }
-  .task-card.needs-confirm .task-detail { color: var(--fg); font-size: 15px; }
+  .task-card.needs-confirm .task-what { font-size: 22px; }
+  .task-card.needs-confirm .task-status { color: var(--warn); font-size: 15px; }
+  .task-card.needs-confirm .task-detail { color: var(--fg); font-size: 30px; font-weight: 700; line-height: 1.3; margin-top: 12px; }
   @keyframes confirm-pulse {
     0%, 100% { box-shadow: 0 0 0 0 rgba(255, 176, 46, 0.45); }
     50%      { box-shadow: 0 0 0 10px rgba(255, 176, 46, 0); }
@@ -199,7 +206,7 @@
   <div class="sidebar">
     <section class="panel tasks-panel">
       <h2>What it's doing</h2>
-      <div id="tasks-body" class="tasks-body"><div class="empty">Nothing yet.</div></div>
+      <div id="tasks-body" class="tasks-body"><div class="empty">Nothing going on right now.</div></div>
     </section>
 
     <section class="panel device-panel">
@@ -355,6 +362,16 @@ function connectEvents() {
 
 const HIGHLIGHT_MS = 4000;
 
+// Only pending/awaiting_confirm/running are "live". Terminal tasks (done,
+// failed, cancelled) still get shown for a short payoff window after they
+// land -- so the user sees the moment something finishes -- then drop out
+// so completed work doesn't crowd out what's actually happening. The window
+// is tracked by wall-clock time of first observing the terminal state, the
+// same approach the device-table row highlight already uses below, rather
+// than "changed on THIS poll" so it survives independent of poll timing.
+const TASK_TERMINAL = new Set(["done", "failed", "cancelled"]);
+const TASK_LINGER_MS = 7000;
+
 const PLAIN_STATUS = {
   pending: "Queued",
   running: "Working on it…",
@@ -368,28 +385,51 @@ const TASK_RANK = { awaiting_confirm: 0, running: 1, pending: 2, done: 3, failed
 
 const lastTaskStatus = {};
 const taskChangedAt = {};
+const taskTerminalSince = {};
 let firstStatePoll = true;
 
 function plainStatus(status) {
   return PLAIN_STATUS[status] || (status ? status[0].toUpperCase() + status.slice(1) : "");
 }
 
+function trackTask(t, now) {
+  if (!firstStatePoll && lastTaskStatus[t.task_id] !== undefined && lastTaskStatus[t.task_id] !== t.status) {
+    taskChangedAt[t.task_id] = now;
+  }
+  lastTaskStatus[t.task_id] = t.status;
+
+  if (TASK_TERMINAL.has(t.status)) {
+    if (taskTerminalSince[t.task_id] === undefined) {
+      // A task that's already terminal the very first time we ever see it
+      // (e.g. the page just loaded) had its payoff moment happen off
+      // screen -- backdate it so it reads as expired instead of lingering.
+      taskTerminalSince[t.task_id] = firstStatePoll ? 0 : now;
+    }
+  } else {
+    delete taskTerminalSince[t.task_id];
+  }
+}
+
+function isTaskVisible(t, now) {
+  if (!TASK_TERMINAL.has(t.status)) return true;
+  const since = taskTerminalSince[t.task_id];
+  return since !== undefined && (now - since) < TASK_LINGER_MS;
+}
+
 function renderTasks(tasks) {
   const el = document.getElementById("tasks-body");
-  if (!tasks.length) {
-    el.innerHTML = '<div class="empty">Nothing yet.</div>';
+  const now = Date.now();
+  tasks.forEach((t) => trackTask(t, now));
+  const visible = tasks.filter((t) => isTaskVisible(t, now));
+  if (!visible.length) {
+    el.innerHTML = '<div class="empty">Nothing going on right now.</div>';
     return;
   }
-  const now = Date.now();
-  const ordered = tasks.map((t, i) => ({ t, i })).sort((a, b) => {
+  const ordered = visible.map((t, i) => ({ t, i })).sort((a, b) => {
     const ra = TASK_RANK[a.t.status] ?? 2, rb = TASK_RANK[b.t.status] ?? 2;
     return ra !== rb ? ra - rb : a.i - b.i;
   });
   const cards = ordered.map(({ t }) => {
-    if (!firstStatePoll && lastTaskStatus[t.task_id] !== undefined && lastTaskStatus[t.task_id] !== t.status) {
-      taskChangedAt[t.task_id] = now;
-    }
-    lastTaskStatus[t.task_id] = t.status;
     const recentlyChanged = (now - (taskChangedAt[t.task_id] || 0)) < HIGHLIGHT_MS;
     const needsConfirm = t.status === "awaiting_confirm";
     const cls = ["task-card", "status-" + String(t.status || "").toLowerCase()];
