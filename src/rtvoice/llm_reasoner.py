@@ -285,20 +285,98 @@ def _describe_where(where: dict | None) -> str:
     return " and ".join(f"{k} = {_fmt(v)}" for k, v in where.items())
 
 
-def _rows_word(n: int) -> str:
-    return "row" if n == 1 else "rows"
+def _noun(table: str, n: int) -> str:
+    """`table`, singularised for exactly one row.
 
-
-def _scope(table: str, where: dict | None, n: int) -> str:
-    """The blast radius, in words. `n` is always counted on the device.
-
-    An unfiltered write says "all", because "9 rows in messages" and "every
-    message you have" are the same fact but only one of them is audibly a
-    whole-table operation.
+    Every table this device has is named for its plural ("contacts",
+    "messages", "places") except "calendar", which already reads right for
+    one entry or many, so it is left alone. A table this heuristic gets
+    wrong just reads a little oddly -- it never touches n, the one number
+    that must always be exactly right.
     """
+    if n == 1 and table.endswith("s") and not table.endswith("ss"):
+        return table[:-1]
+    return table
+
+
+# Fields that read better as a preposition ("from Marcus Webb", "sent
+# 2026-07-26") than as a bare adjective in front of the noun. Anything not
+# listed here (e.g. "group", "cuisine") is spoken as a plain adjective
+# instead ("2 work contacts", "3 chinese places") -- that fallback is safe
+# for an unrecognised field name; it just reads a little flatter.
+_FIELD_PREPOSITIONS = {
+    "contact": "from", "sender": "from", "recipient": "to",
+    "area": "in", "location": "in",
+    "day": "on", "date": "on", "sent": "sent",
+}
+
+# Identity-shaped clauses ("from Marcus Webb") read more naturally right
+# after the noun than a trailing date does, so they are surfaced first when
+# a filter carries more than one prepositional clause.
+_PREPOSITION_PRIORITY = ("contact", "sender", "recipient", "name",
+                        "area", "location", "day", "date", "sent")
+
+
+def _scope_phrase(table: str, where: dict | None, n: int) -> str:
+    """The blast radius, read as an English noun phrase -- no `where`, no
+    `=`, no quoted field names, no "rows in <table>". `n` is always counted
+    on the device and is never allowed to go unsaid: "all 11 contacts" is
+    fine, "several contacts" is not.
+    """
+    noun = _noun(table, n)
     if not where:
-        return f"all {n} {_rows_word(n)} in {table}"
-    return f"{n} {_rows_word(n)} in {table} where {_describe_where(where)}"
+        return f"all {n} {noun}"
+
+    adjectives: list[str] = []
+    clauses: list[tuple[str, str]] = []
+    for key, value in where.items():
+        sv = _spoken(value)
+        prep = _FIELD_PREPOSITIONS.get(key)
+        if prep:
+            clauses.append((key, f"{prep} {sv}"))
+        else:
+            adjectives.append(sv)
+    clauses.sort(key=lambda kc: _PREPOSITION_PRIORITY.index(kc[0])
+                 if kc[0] in _PREPOSITION_PRIORITY else len(_PREPOSITION_PRIORITY))
+
+    prefix = " ".join(adjectives) + " " if adjectives else ""
+    phrase = f"{n} {prefix}{noun}"
+    if clauses:
+        phrase += " " + " ".join(clause for _, clause in clauses)
+    return phrase
+
+
+def _rendered_update(table: str, where: dict | None, values: dict, n: int,
+                     *, past: bool) -> tuple[str, str]:
+    """The spoken update, as (action, count_clause).
+
+    Renaming (the field a user is scoping BY is also the one whose new
+    value they're setting -- "rename Priya to Jude") is the shape almost
+    every real update takes on a phone, so it gets a dedicated phrasing.
+    When that also happens to identify a single record, the filter's own
+    value ("Priya") reads better than a bare count -- but the count would
+    then be nowhere in the sentence at all, and it must never simply go
+    missing, so it is stated once more as its own short clause. Every other
+    shape states the count inline, via `_scope_phrase`, and needs no
+    separate clause.
+    """
+    shared = [k for k in values if where and k in where]
+    rename = "renamed" if past else "rename"
+
+    if shared and n == 1:
+        # The filter's own value ("Priya") IS the target -- no scope phrase
+        # needed, but its count then appears nowhere else, so it is stated
+        # once more as its own short clause.
+        target = _spoken(where[shared[0]])
+        new = " ".join(_spoken(v) for v in values.values())
+        return f"{rename} {target} to {new}", f" {n} {_noun(table, n)}."
+    if shared or len(values) == 1:
+        new = " ".join(_spoken(v) for v in values.values())
+        return f"{rename} {_scope_phrase(table, where, n)} to {new}", ""
+
+    update = "updated" if past else "update"
+    new = ", ".join(f"{k.replace('_', ' ')} {_spoken(v)}" for k, v in values.items())
+    return f"{update} {_scope_phrase(table, where, n)}: {new}", ""
 
 
 def _spoken(value: Any) -> str:
@@ -692,8 +770,13 @@ class LlmReasoner:
                                 understood_as=f"add a row to {table}: {_describe_record(values)}"),
                 ReasonerMessage(
                     kind="confirm_required", task_id=tid,
-                    verbatim_text=f"This will add 1 row to {table}: "
-                                  f"{_describe_record(values)}. Confirm?",
+                    # Spoken, so no quotes, no "row to <table>": the same
+                    # unquoted "field value" style already used for reading a
+                    # matched row aloud (_row_summary). An insert never has a
+                    # model-claimed count to distrust -- it is always exactly
+                    # one record -- so there is no count to state here.
+                    verbatim_text=f"This will add to {table}: "
+                                  f"{_row_summary(values)}. Confirm?",
                 ),
             ]
 
@@ -707,16 +790,18 @@ class LlmReasoner:
 
         if intent.operation == "update":
             understood = f"{_describe_values(values)} in {table} where {_describe_where(where)}"
-            nothing = f"nothing in {table} matches {_describe_where(where)}, so nothing changed"
-            question = f"This will update {_scope(table, where, n)}: {_describe_values(values)}. Confirm?"
+            nothing = f"no {_noun(table, 0)} matched, so nothing changed"
+            action, count_clause = _rendered_update(table, where, values, n, past=False)
+            question = f"This will {action}.{count_clause} Confirm?"
         else:
             understood = f"delete from {table} where {_describe_where(where)}"
-            nothing = f"nothing in {table} matches {_describe_where(where)}, so nothing was deleted"
+            nothing = f"no {_noun(table, 0)} matched, so nothing was deleted"
             # An unfiltered delete is the most destructive thing this device
             # can do, and must not be describable as anything vaguer than what
-            # it is.
-            emptied = ", leaving the table empty" if not where else ""
-            question = f"This will delete {_scope(table, where, n)}{emptied}. Confirm?"
+            # it is -- "leaving nothing" alongside "all N <noun>" says so
+            # twice over, in plain words, with no SQL-ish syntax.
+            emptied = ", leaving nothing" if not where else ""
+            question = f"This will delete {_scope_phrase(table, where, n)}{emptied}. Confirm?"
 
         if n == 0:
             # Nothing matches, so there is no blast radius to consent to and no
@@ -788,14 +873,18 @@ class LlmReasoner:
 
         if plan["op"] == "insert":
             created = self.device.insert(table, values, token=token)
-            return f"added 1 row to {table}: {_row_summary(created)}"
+            return f"added to {table}: {_row_summary(created)}"
 
         if plan["op"] == "delete":
             n = self.device.delete(table, where, token=token)
-            return f"deleted {n} {_rows_word(n)} from {table}"
+            return f"deleted {n} {_noun(table, n)}"
 
         n = self.device.update(table, values, where, token=token)
-        return f"updated {n} {_rows_word(n)} in {table}: {_describe_values(values)}"
+        action, count_clause = _rendered_update(table, where, values, n, past=True)
+        # count_clause, when present, is its own trailing sentence ("
+        # 1 contact.") and needs a full stop after `action` to separate the
+        # two; when absent, `action` alone is the whole (unpunctuated) result.
+        return f"{action}.{count_clause}" if count_clause else action
 
     def _forget(self, task_id: str | None) -> None:
         self._tokens.pop(task_id, None)

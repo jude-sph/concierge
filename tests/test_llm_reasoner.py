@@ -226,8 +226,7 @@ async def test_renames_a_single_record_by_name(tmp_path):
 
     tid = only(out, "confirm_required").task_id
     done = await answer(reasoner, tid, "yes")
-    assert only(done, "done").result == (
-        'updated 1 row in contacts: set first_name to "Jude" and last_name to "Hawrani"')
+    assert only(done, "done").result == "renamed Priya to Jude Hawrani. 1 contact."
     assert names(reasoner) == ["Sarah", "Marcus", "Jude", "Tom"]
     assert reasoner.device.query("contacts", {"first_name": "Jude"})[0]["last_name"] == "Hawrani"
 
@@ -242,8 +241,7 @@ async def test_scoped_update_touches_only_the_filtered_rows(tmp_path):
 
     out = await say(reasoner, "change my work contacts to Hans")
     verbatim = only(out, "confirm_required").verbatim_text
-    assert verbatim == ('This will update 2 rows in contacts where group = "work": '
-                        'set first_name to "Hans". Confirm?')
+    assert verbatim == "This will rename 2 work contacts to Hans. Confirm?"
 
     await answer(reasoner, only(out, "confirm_required").task_id, "go ahead")
     assert names(reasoner) == ["Hans", "Hans", "Priya", "Tom"]
@@ -352,11 +350,11 @@ async def test_scoped_delete(tmp_path):
 
     assert kinds(out) == ["ack", "confirm_required"]
     assert only(out, "confirm_required").verbatim_text == (
-        'This will delete 3 rows in messages where sent = "2026-07-26". Confirm?')
+        "This will delete 3 messages sent 2026-07-26. Confirm?")
     assert ids(reasoner, "messages") == [1, 2, 3, 4, 5]  # nothing gone yet
 
     done = await answer(reasoner, only(out, "confirm_required").task_id, "yes")
-    assert only(done, "done").result == "deleted 3 rows from messages"
+    assert only(done, "done").result == "deleted 3 messages"
     assert ids(reasoner, "messages") == [1, 5]
 
 
@@ -372,8 +370,9 @@ async def test_a_narrower_scope_deletes_strictly_less(tmp_path):
     out = await say(reasoner,
                     "delete the messages from yesterday, just the ones from Marcus")
     verbatim = only(out, "confirm_required").verbatim_text
-    assert "2 rows in messages" in verbatim
-    assert 'sent = "2026-07-26" and contact = "Marcus Webb"' in verbatim
+    assert "2 messages" in verbatim
+    assert "from Marcus Webb" in verbatim
+    assert "sent 2026-07-26" in verbatim
 
     await answer(reasoner, only(out, "confirm_required").task_id, "yes")
     assert ids(reasoner, "messages") == [1, 4, 5]
@@ -390,11 +389,11 @@ async def test_an_unfiltered_delete_says_it_empties_the_table(tmp_path):
     out = await say(reasoner, "get rid of my messages")
 
     assert only(out, "confirm_required").verbatim_text == (
-        "This will delete all 5 rows in messages, leaving the table empty. Confirm?")
+        "This will delete all 5 messages, leaving nothing. Confirm?")
     assert ids(reasoner, "messages") == [1, 2, 3, 4, 5]
 
     done = await answer(reasoner, only(out, "confirm_required").task_id, "yes")
-    assert only(done, "done").result == "deleted 5 rows from messages"
+    assert only(done, "done").result == "deleted 5 messages"
     assert reasoner.device.query("messages") == []
 
 
@@ -441,13 +440,13 @@ async def test_insert(tmp_path):
 
     assert kinds(out) == ["ack", "confirm_required"]
     assert only(out, "confirm_required").verbatim_text == (
-        'This will add 1 row to calendar: title "reminder", day "2026-07-28", '
-        'when "2026-07-28T09:00". Confirm?')
+        "This will add to calendar: title reminder, day 2026-07-28, "
+        "when 2026-07-28T09:00. Confirm?")
     assert ids(reasoner, "calendar") == [1, 2, 3]
 
     done = await answer(reasoner, only(out, "confirm_required").task_id, "yes")
     assert only(done, "done").result == (
-        "added 1 row to calendar: title reminder, day 2026-07-28, "
+        "added to calendar: title reminder, day 2026-07-28, "
         "when 2026-07-28T09:00")
     assert ids(reasoner, "calendar") == [1, 2, 3, 4]
     assert reasoner.device.query("calendar", {"id": 4})[0]["title"] == "reminder"
@@ -571,12 +570,12 @@ async def test_confirm_states_the_real_count_from_the_device_not_the_model(tmp_p
     out = await say(reasoner, "change my work contacts to Hans")
     verbatim = only(out, "confirm_required").verbatim_text
 
-    assert "2 rows" in verbatim
+    assert "2 work contacts" in verbatim
     assert "99" not in verbatim
 
     # and the completion report is counted at write time, from the write
     done = await answer(reasoner, only(out, "confirm_required").task_id, "yes")
-    assert only(done, "done").result == 'updated 2 rows in contacts: set first_name to "Hans"'
+    assert only(done, "done").result == "renamed 2 work contacts to Hans"
     assert "99" not in only(done, "done").result
 
 
@@ -595,7 +594,7 @@ async def test_delete_confirm_states_the_real_count_not_the_model_s(tmp_path):
     verbatim = only(out, "confirm_required").verbatim_text
 
     assert verbatim == (
-        "This will delete all 5 rows in messages, leaving the table empty. Confirm?")
+        "This will delete all 5 messages, leaving nothing. Confirm?")
     assert "3" not in verbatim
     assert ids(reasoner, "messages") == [1, 2, 3, 4, 5]
 
@@ -608,7 +607,7 @@ async def test_unfiltered_update_states_the_whole_table_count(tmp_path):
         "understood_as": "change 3 contacts", "affected_rows": 3,
     }))
     out = await say(reasoner, "change all my contacts to Hans")
-    assert "all 4 rows" in only(out, "confirm_required").verbatim_text
+    assert "all 4 contacts" in only(out, "confirm_required").verbatim_text
 
 
 @pytest.mark.asyncio
@@ -626,12 +625,11 @@ async def test_unfiltered_update_confirms_true_count_and_changes_every_record(tm
 
     out = await say(reasoner, "set all my contacts to Hans")
     verbatim = only(out, "confirm_required").verbatim_text
-    assert "all 4 rows in contacts" in verbatim
+    assert "all 4 contacts" in verbatim
     assert names(reasoner) == ["Sarah", "Marcus", "Priya", "Tom"]  # nothing yet
 
     done = await answer(reasoner, only(out, "confirm_required").task_id, "yes")
-    assert only(done, "done").result == (
-        'updated 4 rows in contacts: set first_name to "Hans"')
+    assert only(done, "done").result == "renamed all 4 contacts to Hans"
     assert names(reasoner) == ["Hans", "Hans", "Hans", "Hans"]
 
 
