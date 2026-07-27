@@ -80,23 +80,28 @@ class DeviceState:
         """
         rows = self._working.get(table, [])
         kept: list[dict] = []
-        n = 0
+        removed: list[dict] = []
         i = 0
         try:
             for i, row in enumerate(rows):
                 if token is not None:
                     token.check()
                 if self._matches(row, where):
-                    n += 1
+                    removed.append(row)
                 else:
                     kept.append(row)
             self._working[table] = kept
-            self._journal("delete", table=table, where=where, rows=n)
-            return n
+            # The removed rows go in the journal, not just their count: an
+            # update can be described by its `set` fields, but a delete that
+            # recorded only "3 rows" would leave nothing to undo from.
+            self._journal("delete", table=table, where=where,
+                          rows=len(removed), removed=removed)
+            return len(removed)
         except Cancelled:
             # Everything from the row that was interrupted onward is untouched.
             self._working[table] = kept + rows[i:]
-            self._journal("delete", table=table, where=where, rows=n, cancelled=True)
+            self._journal("delete", table=table, where=where, rows=len(removed),
+                          removed=removed, cancelled=True)
             raise
 
     def insert(

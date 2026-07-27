@@ -155,8 +155,10 @@ def test_journal_records_delete_and_cancelled_delete(dev):
     entries = [json.loads(l) for l in dev.journal_path.read_text().splitlines() if l.strip()]
     done = next(e for e in entries if e["op"] == "delete" and not e.get("cancelled"))
     assert done["table"] == "contacts" and done["rows"] == 2
+    # the rows themselves, not just how many: nothing else could undo a delete
+    assert [r["first_name"] for r in done["removed"]] == ["Sarah", "Marcus"]
     cancelled = next(e for e in entries if e["op"] == "delete" and e.get("cancelled"))
-    assert cancelled["rows"] == 0
+    assert cancelled["rows"] == 0 and cancelled["removed"] == []
 
 
 # --- insert ------------------------------------------------------------------

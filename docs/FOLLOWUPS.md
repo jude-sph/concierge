@@ -1,7 +1,32 @@
 # Known issues and follow-ups
 
-State as of the core-loop branch (`feat/voice-interface-core-loop`, 185 tests passing).
+State as of the core-loop branch (`feat/voice-interface-core-loop`, 353 tests passing).
 Everything here was found by review and consciously carried rather than missed.
+
+## The LLM reasoner (`REASONER=llm`)
+
+`LlmReasoner` has never spoken to a real model — every test drives a faked HTTP POST, which
+is what keeps the suite offline. Everything downstream of the model's JSON is proven; the
+quality of the JSON itself is not. What to watch for on the 3090:
+
+- **Filters are equality-only.** `DeviceState._matches` compares with `==`, so there is no
+  range, prefix or substring matching. "Messages from last week" is not expressible; the
+  fixture works around it by carrying a date-only `sent` on messages and a date-only `day`
+  beside the ISO `when` on calendar entries. A `find contacts called Nair` works only if the
+  model filters on `last_name` exactly. Any real corpus will want operators.
+- **Relative dates are pre-resolved in the prompt** (`_date_block`) rather than trusted to
+  the model. If a session runs past midnight the block is only recomputed per utterance, so
+  a task planned before midnight and confirmed after it still writes the date it was planned
+  with — which is the desired behaviour, but only by accident.
+- **A wrong-but-valid filter is undetectable.** The count in `confirm_required` is always
+  true for the filter that will run, but if the model plans `group = "work"` when the user
+  meant "the London group", the user hears an accurate count of the wrong rows. The
+  confirmation makes it audible; nothing makes it impossible.
+- **`misreads` is the metric to watch.** It counts transport failures, unparseable output and
+  plans naming things the device does not have. None of them mutate anything, so a high rate
+  is a quality signal, not a safety one.
+- **No undo.** The journal records every staged operation including the record contents of a
+  delete, so "undo the 12 I already deleted" is *answerable*, but nothing implements it.
 
 ## Blocked on hardware
 
