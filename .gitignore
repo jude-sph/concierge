@@ -7,3 +7,4 @@ venv/
 *.wav
 *.pth
 pretrained_models/
+sessions/
