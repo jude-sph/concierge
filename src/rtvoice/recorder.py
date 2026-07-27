@@ -18,22 +18,40 @@ class SessionRecorder:
     def __init__(self, session_dir: str | Path) -> None:
         self.dir = Path(session_dir)
         self.dir.mkdir(parents=True, exist_ok=True)
-        self._user: list[np.ndarray] = []
-        self._model: list[np.ndarray] = []
+        self._user_file = sf.SoundFile(
+            self.dir / "user.wav", "w", samplerate=SAMPLE_RATE, channels=1, subtype="FLOAT"
+        )
+        self._model_file = sf.SoundFile(
+            self.dir / "model.wav", "w", samplerate=SAMPLE_RATE, channels=1, subtype="FLOAT"
+        )
+        self._closed = False
 
     def write_user(self, chunk: np.ndarray) -> None:
-        self._user.append(np.asarray(chunk, dtype=np.float32).copy())
+        if not self._closed:
+            self._user_file.write(np.asarray(chunk, dtype=np.float32))
 
     def write_model(self, chunk: np.ndarray) -> None:
-        self._model.append(np.asarray(chunk, dtype=np.float32).copy())
+        if not self._closed:
+            self._model_file.write(np.asarray(chunk, dtype=np.float32))
 
     def close(self) -> None:
-        user = np.concatenate(self._user) if self._user else np.zeros(0, dtype=np.float32)
-        model = np.concatenate(self._model) if self._model else np.zeros(0, dtype=np.float32)
+        if self._closed:
+            return
+        self._closed = True
+        self._user_file.close()
+        self._model_file.close()
 
-        sf.write(self.dir / "user.wav", user, SAMPLE_RATE)
-        sf.write(self.dir / "model.wav", model, SAMPLE_RATE)
+        # Read back the written files to construct the mix
+        user, _ = sf.read(self.dir / "user.wav", dtype="float32")
+        model, _ = sf.read(self.dir / "model.wav", dtype="float32")
 
+        # Handle scalar case (single sample becomes 0-d array)
+        if user.ndim == 0:
+            user = np.array([user], dtype=np.float32)
+        if model.ndim == 0:
+            model = np.array([model], dtype=np.float32)
+
+        # Create stereo mix with zero-padding for unequal lengths
         n = max(len(user), len(model))
         mix = np.zeros((n, 2), dtype=np.float32)
         mix[: len(user), 0] = user

@@ -28,14 +28,14 @@ class KokoroTTS:
 
         self._pipeline = KPipeline(lang_code=lang_code)
         self.voice = voice
-        self._stopped = False
+        self._generation = 0
 
     def stop(self) -> None:
-        self._stopped = True
+        self._generation += 1
 
     async def stream(self, text: str) -> AsyncIterator[np.ndarray]:
-        self._stopped = False
+        generation = self._generation
         for _, _, audio in self._pipeline(text, voice=self.voice):
-            if self._stopped:
+            if generation != self._generation:
                 return
             yield _resample(np.asarray(audio, dtype=np.float32), KOKORO_RATE, SAMPLE_RATE)
