@@ -16,7 +16,7 @@ from .events import EventLog
 from .policy import AskConcierge, PolicyState, SendUtterance, Stop, decide
 from .protocol import OrchestratorMessage, ReasonerMessage
 from .registry import TaskRegistry, TaskStatus
-from .states import TurnEvent, UserState
+from .states import TurnEvent, UserState, is_answer_shaped
 
 SPEAK_ON = {"done", "failed", "need_clarification", "confirm_required"}
 
@@ -37,6 +37,14 @@ class Orchestrator:
         self.policy_state = PolicyState()
         self.history: list[dict] = []
         self.tokens: dict[str, CancellationToken] = {}
+        # Pending yes/no questions, keyed by the task that asked. PolicyState
+        # carries a single `pending_question` slot but AWAITING_CONFIRM is
+        # per-task: setting that slot on ANY confirm_required and clearing it
+        # on ANY done/failed meant that for a compound command, the second
+        # clause finishing wiped the first clause's question, and clause ORDER
+        # decided whether a bare "yes" was heard as an answer at all. The slot
+        # is now DERIVED from this dict (see _sync_pending_question).
+        self._pending_questions: dict[str, str] = {}
         self._seq = 0
         self.silence_timeout_ms = silence_timeout_ms
         self.reasoner_timeout_s = reasoner_timeout_s
@@ -163,14 +171,61 @@ class Orchestrator:
                     self.log.append("turn_task_error",
                                     error=repr(result), error_type=type(result).__name__)
 
-    async def _dispatch(self, text: str) -> None:
+    def _sync_pending_question(self) -> None:
+        """Re-derive PolicyState's single pending_question slot from the
+        per-task questions, dropping any whose task is no longer awaiting.
+
+        Deriving it (rather than setting and clearing it at each call site)
+        is what makes it impossible for one task's completion to clear
+        another task's question, and impossible for an abort to leave a
+        question set forever -- which disabled reflexive barge-in for the
+        rest of the session, since policy.decide() then read every NONIDLE
+        as an answer instead of an interruption.
+        """
+        for tid in list(self._pending_questions):
+            task = self.registry.get(tid)
+            if task is None or task.status != TaskStatus.AWAITING_CONFIRM:
+                del self._pending_questions[tid]
+        questions = list(self._pending_questions.values())
+        # The most recent question is the one the user is being asked.
+        self.policy_state.pending_question = questions[-1] if questions else None
+
+    def _answer_target(self, text: str) -> str | None:
+        """The task this utterance ANSWERS, if any.
+
+        Routing every utterance to the pending task while one is awaiting
+        confirmation is how a non-answer became a destructive commit. A
+        pending yes/no question only captures an utterance that is actually
+        shaped like a yes/no answer; anything else -- a new command, an aside
+        to someone else, the user's own continuation of a sentence the
+        silence timer force-dispatched -- is dispatched as a fresh utterance
+        and leaves the question pending, resolved neither way.
+
+        An open clarification ("which contacts?") is different: it asks for
+        free-form content, so any non-empty utterance answers it.
+        """
+        if not text.strip():
+            return None
         awaiting = [t for t in self.registry.all()
                     if t.status == TaskStatus.AWAITING_CONFIRM]
-        if awaiting:
+        if not awaiting:
+            return None
+        target = awaiting[-1]
+        if target.task_id in self._pending_questions and not is_answer_shaped(text):
+            return None
+        return target.task_id
+
+    async def _dispatch(self, text: str) -> None:
+        target = self._answer_target(text)
+        if target is not None:
             msg = OrchestratorMessage(kind="clarification_answer",
-                                      task_id=awaiting[0].task_id,
+                                      task_id=target,
                                       text=text, seq=self._next_seq())
         else:
+            if self._pending_questions:
+                self.log.append("confirm_left_pending",
+                                task_ids=list(self._pending_questions),
+                                transcript=text)
             msg = OrchestratorMessage(kind="utterance", text=text,
                                       raw_transcript=text, seq=self._next_seq())
 
@@ -203,10 +258,11 @@ class Orchestrator:
             self.registry.apply(m)
             if m.kind in SPEAK_ON:
                 should_speak = True
-            if m.kind == "confirm_required":
-                self.policy_state.pending_question = m.verbatim_text
-            if m.kind in ("done", "failed"):
-                self.policy_state.pending_question = None
+            if m.kind == "confirm_required" and m.task_id:
+                self._pending_questions[m.task_id] = m.verbatim_text
+        # Derived, not assigned: a question belongs to the task that asked it,
+        # and is cleared only when THAT task stops awaiting an answer.
+        self._sync_pending_question()
         if not should_speak:
             return
         if self.use_concierge:
@@ -269,6 +325,12 @@ class Orchestrator:
         if token is not None:
             token.cancel()
         self.registry.mark_cancelled(task_id)
+        # An aborted task's question is gone with it. Left set, PolicyState's
+        # pending_question makes decide() read every subsequent NONIDLE as an
+        # answer rather than a barge-in, so "Stop!" stops halting speech for
+        # the rest of the session.
+        self._pending_questions.pop(task_id, None)
+        self._sync_pending_question()
         self.log.append("aborted", task_id=task_id)
         msg = OrchestratorMessage(kind="cancel", task_id=task_id, seq=self._next_seq())
         asyncio.create_task(self.reasoner.handle(msg))
