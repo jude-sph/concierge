@@ -38,6 +38,35 @@ def make_chunk(level: float, seed: int, n: int = CHUNK_SAMPLES) -> np.ndarray:
     return (raw * (level / current)).astype(np.float32)
 
 
+def make_speech_chunk(
+    rms_target: float,
+    peak_target: float,
+    seed: int,
+    n: int = CHUNK_SAMPLES,
+    bg_sigma: float = 0.002,
+) -> np.ndarray:
+    """A chunk shaped like real quiet speech: a low background level plus a
+    handful of higher-amplitude samples (glottal pulses / voiced
+    excitation), rather than uniform gaussian noise.
+
+    `make_chunk` above scales gaussian noise to a target RMS, but gaussian
+    noise has a crest factor (peak/rms) of only ~3-4 -- real speech runs much
+    peakier (the "Yes." clip this whole class exists for was rms 0.0174,
+    peak 0.29, crest ~17). A test that wants to pin *peak* behaviour needs a
+    chunk whose rms and peak can be set independently, which plain gaussian
+    scaling cannot do.
+    """
+    rng = np.random.default_rng(seed)
+    bg = (rng.standard_normal(n) * bg_sigma).astype(np.float64)
+    k = max(1, min(n, int(round(n * (rms_target**2) / (peak_target**2)))))
+    idx = rng.choice(n, size=k, replace=False)
+    signs = rng.choice([-1.0, 1.0], size=k)
+    mags = peak_target * rng.uniform(0.85, 1.0, size=k)
+    mags[0] = peak_target  # guarantee the chunk's true peak hits the target
+    bg[idx] = signs * mags
+    return bg.astype(np.float32)
+
+
 class FakeClient:
     """Stands in for SoulXClient: records the exact audio it was fed upstream
     and returns a `blank` state so StateAdapter emits no events."""
@@ -230,23 +259,30 @@ async def test_gain_estimate_adapts_across_a_sequence_rather_than_per_chunk(tmp_
 # --- short utterances must reach target FAST, not just eventually ------------------
 
 @pytest.mark.asyncio
-async def test_short_quiet_utterance_reaches_target_band_before_it_ends(tmp_path):
+async def test_short_quiet_utterance_reaches_peak_target_band_before_it_ends(tmp_path):
     """Regression for a real "Yes." (2.75s, peak 0.29, rms 0.0174) that the
-    upstream turn-taking model silently dropped even though AGC's *final*-chunk
-    gain (2.83x) looked fine in isolation. The real bug: the level EMA starts
-    neutral and ramps slowly, so the audio actually sent upstream for a short
-    utterance averages out far below the model's usable band before the gain
-    catches up (measured overall output rms ~0.024 on the real clip). Gain
-    sweeps against the real model showed OK only for overall output rms in
-    ~0.035-0.052; below that (or clipped, at gain 4x) it was dropped.
+    upstream turn-taking model silently dropped -- zero turn events. A gain
+    sweep against the real upstream model (on a GPU; see AutoGainControl's
+    docstring for the full table) showed peak, not RMS, is what predicts the
+    outcome: every success sat at output peak ~0.55-0.87; every failure was
+    either too quiet (peak <= 0.435) or clipped (peak == 1.000 -- and
+    clipping was the *worst* outcome measured, a turn with an EMPTY
+    transcript, worse than being dropped outright).
+
+    This replaces a prior version of this test that asserted an overall
+    output RMS band (0.035-0.052). That criterion came from the RMS-targeted
+    predecessor of this design and is no longer the right one to check --
+    that predecessor drove all four real test clips to output peak 1.000,
+    i.e. satisfying an RMS band is not sufficient to avoid clipping.
 
     Shape this like the real clip: silence, then a short (<1s) burst of
-    rms ~0.017 speech, then silence again."""
-    voice, fake = make_voice(tmp_path, agc=True, agc_target_rms=0.05)
+    rms~0.017/peak~0.29 speech, then silence again."""
+    voice, fake = make_voice(tmp_path, agc=True)
     try:
         silence = np.zeros(CHUNK_SAMPLES, dtype=np.float32)
-        speech_level = 0.017
-        burst = [make_chunk(speech_level, seed=800 + i) for i in range(5)]  # 5*160ms = 800ms
+        burst = [
+            make_speech_chunk(0.017, 0.29, seed=800 + i) for i in range(5)
+        ]  # 5*160ms = 800ms
 
         await feed_many(voice, [silence, silence])
         n_before = len(fake.fed)
@@ -254,10 +290,10 @@ async def test_short_quiet_utterance_reaches_target_band_before_it_ends(tmp_path
         speech_sent = fake.fed[n_before:]
         await feed_many(voice, [silence, silence])
 
-        overall_rms = rms(np.concatenate(speech_sent))
-        assert 0.035 <= overall_rms <= 0.052, overall_rms
         for out in speech_sent:
-            assert np.max(np.abs(out)) <= 1.0 + 1e-6
+            peak = float(np.max(np.abs(out)))
+            assert 0.55 <= peak <= 0.85, peak
+            assert peak <= 1.0 + 1e-6
 
         # The property that matters most must survive the faster attack:
         # silence around the burst must still be untouched, not smeared by
@@ -266,6 +302,99 @@ async def test_short_quiet_utterance_reaches_target_band_before_it_ends(tmp_path
             np.testing.assert_allclose(sent, original, atol=1e-7)
         for original, sent in zip([silence, silence], fake.fed[-2:]):
             np.testing.assert_allclose(sent, original, atol=1e-7)
+    finally:
+        voice.close()
+
+
+# --- the hard ceiling must never be crossed, even by already-loud input ------------
+
+@pytest.mark.asyncio
+async def test_output_peak_never_reaches_full_scale_even_on_deliberately_loud_input(
+    tmp_path,
+):
+    """The hard ceiling is a correctness requirement, not a nicety: the
+    prior (RMS-targeted, now-replaced) AGC design drove real clips to output
+    peak exactly 1.000, and on the real upstream model that produced a turn
+    with an EMPTY transcript -- worse than being dropped, because downstream
+    code then dispatches a blank utterance. Output peak must never reach 1.0
+    on ANY input, including one that is already at full scale on its own
+    (which the old "only ever boost, never attenuate" rule would have let
+    straight through unchanged)."""
+    voice, fake = make_voice(tmp_path, agc=True)
+    try:
+        rng = np.random.default_rng(42)
+        raw = rng.standard_normal(CHUNK_SAMPLES)
+        already_clipped = (raw / np.max(np.abs(raw))).astype(np.float32)  # peak == 1.0
+
+        for _ in range(5):
+            await voice.feed_audio(already_clipped)
+            sent = fake.fed[-1]
+            peak = float(np.max(np.abs(sent)))
+            assert peak < 1.0, peak
+            assert peak <= 0.9 + 1e-6, peak
+    finally:
+        voice.close()
+
+
+# --- already-loud audio is barely touched, and stays clear of the ceiling ----------
+
+@pytest.mark.asyncio
+async def test_already_loud_clip_is_amplified_only_slightly(tmp_path):
+    """A clip like the ones already known to work upstream (peak ~0.5, in
+    the corpus's proven-good 0.41-0.55 "naturally good" band) must not be
+    pushed hard toward the target -- only a modest boost, well clear of the
+    ceiling."""
+    voice, fake = make_voice(tmp_path, agc=True)
+    try:
+        rng = np.random.default_rng(11)
+        raw = rng.standard_normal(CHUNK_SAMPLES)
+        half_loud = (raw / np.max(np.abs(raw)) * 0.5).astype(np.float32)
+        original_peak = float(np.max(np.abs(half_loud)))
+
+        for _ in range(10):
+            await voice.feed_audio(half_loud)
+
+        sent = fake.fed[-1]
+        peak = float(np.max(np.abs(sent)))
+        assert peak <= 0.9 + 1e-6, peak
+        assert peak / original_peak <= 1.5, peak / original_peak
+    finally:
+        voice.close()
+
+
+# --- gain must not chase a single transient spike ----------------------------------
+
+@pytest.mark.asyncio
+async def test_gain_does_not_chase_a_single_transient_spike(tmp_path):
+    """A lone spiky sample (a click, a mic pop) inside an otherwise steady
+    quiet chunk must not permanently redefine "the speech level" for the
+    chunks that follow it. The running peak estimate is smoothed across the
+    sequence specifically so an isolated outlier sample doesn't get chased
+    up (and the recovery back down doesn't linger for many chunks
+    afterward) -- peak, being a `max()`, is far more exposed to a single
+    outlier sample than RMS ever was, so this matters more for this design
+    than it did for the predecessor."""
+    voice, fake = make_voice(tmp_path, agc=True)
+    try:
+        def steady_chunk(seed: int, peak: float = 0.15) -> np.ndarray:
+            r = np.random.default_rng(seed).standard_normal(CHUNK_SAMPLES)
+            return (r / np.max(np.abs(r)) * peak).astype(np.float32)
+
+        for i in range(10):
+            await voice.feed_audio(steady_chunk(100 + i))
+        pre_spike_gain = voice.last_agc_gain
+
+        spike = steady_chunk(200)
+        spike[5] = 0.95
+        spike[6] = -0.9
+        await voice.feed_audio(spike)
+        spike_sent = fake.fed[-1]
+        assert float(np.max(np.abs(spike_sent))) <= 0.9 + 1e-6  # ceiling still holds
+
+        await voice.feed_audio(steady_chunk(300))
+        post_spike_gain = voice.last_agc_gain
+
+        assert post_spike_gain > 0.7 * pre_spike_gain, (pre_spike_gain, post_spike_gain)
     finally:
         voice.close()
 

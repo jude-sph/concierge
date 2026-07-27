@@ -29,58 +29,85 @@ class AutoGainControl:
     Why this exists: the upstream turn-taking model gates out chunks below
     ~0.02 RMS as far-field noise, and short quiet utterances get reset before
     they can accumulate. A real "Yes." confirming a destructive write was
-    silently dropped -- zero turn events -- at RMS 0.017; the identical clip
-    peak-normalised to RMS ~0.07 was transcribed correctly. Quiet speech is
-    normal (trailing off, sitting back), so this exists to bring it up to a
-    level the model reliably hears, without turning room tone into fake
-    speech.
+    silently dropped -- zero turn events -- at RMS 0.017 / peak 0.29.
+
+    This is the SECOND design, replacing an RMS-targeted one that overshot.
+    A sweep of gain levels against the real upstream model (on a GPU, not
+    available in this dev environment) showed the true picture:
+
+        variant                       peak    model result
+        raw (0.29)                    0.290   DROPPED (too quiet)
+        uniform 2.0x-3.0x             0.58-0.87  OK
+        uniform 4.0x                  1.000   DROPPED (clipped)
+        peak-normalised to 0.70        0.700   OK, cleanest
+        prior AGC (RMS-target, snap)   1.000   1 turn but EMPTY TRANSCRIPT
+
+    Every success sat in output peak ~0.55-0.87; every failure was either
+    too quiet (peak <= 0.435) or clipped (peak == 1.000, worst of all --
+    clipping produced a turn with a blank transcript, which is worse than
+    being dropped because downstream code then acts on an empty utterance).
+    The RMS-targeted predecessor drove all four real test clips to peak
+    1.000, i.e. it was optimizing the wrong variable: RMS headroom does not
+    predict peak headroom for real speech, whose crest factor varies chunk
+    to chunk. Peak is therefore the control variable here, not RMS.
 
     Design, each point load-bearing:
 
-    - The gain is driven by a running EMA of *speech-like* chunk RMS, not by
-      each chunk's own level. Per-chunk normalisation would amplify silence
-      into noise and destroy the very silence detection the turn-taking
-      model depends on (a chunk near zero divided by its own near-zero RMS
-      is undefined/huge). Smoothing over a sequence is also what makes the
-      gain applied to any one chunk not swing wildly on an outlier.
+    - The gain is driven by a running estimate of *speech-like* chunk peak
+      (each chunk's own `max(abs(chunk))`), smoothed with a single EMA
+      coefficient (`smoothing`) across the sequence -- not applied per chunk
+      from that chunk's own peak. A single stray sample (a click, a brief
+      clip-like transient) is damped by the EMA rather than immediately
+      redefining "the speech level" for every subsequent chunk; the running
+      estimate moves by only `(1 - smoothing)` of the way toward any one
+      chunk's observed peak. This is what keeps the gain from chasing a
+      one-off transient spike up and back down.
     - Any chunk whose OWN rms is below `floor_rms` is passed through
-      untouched and does not perturb the running estimate. This check is
-      per-chunk and independent of the running estimate on purpose: a
-      silent chunk arriving right after loud speech must not be boosted by
-      a stale high estimate.
-    - The first speech-like chunk after a silent gap snaps the running
-      estimate straight to that chunk's own level instead of easing into it
+      untouched and does not perturb the running estimate (silence
+      detection stays RMS-based -- a peak-based floor would be fooled by a
+      single noise sample). This check is per-chunk and independent of the
+      running estimate on purpose: a silent chunk arriving right after loud
+      speech must not be boosted by a stale high estimate.
+    - The first speech-like chunk after a silent gap snaps the running peak
+      estimate straight to that chunk's own peak instead of easing into it
       from whatever the estimate was before the gap (fast attack; ordinary
       EMA smoothing resumes on the chunks after that, i.e. slower release).
       Without this, a short utterance -- a one-word confirmation being the
-      exact case that matters -- can end before a slow EMA ramp from a
-      neutral start ever reaches a useful gain: measured on real hardware,
-      a "Yes." whose *final*-chunk gain looked fine (2.83x) was still
-      silently dropped, because the OVERALL audio actually sent upstream
-      averaged out at only ~1.36x effective gain.
-    - The gain is clamped to [1.0, max_gain]: it only ever boosts (audio
-      that is already at or above target is left alone rather than
-      attenuated -- levels that already worked upstream must not be
-      touched) and never boosts more than `max_gain`, so a near-silent
-      chunk that barely clears the floor can't be blown up.
-    - After scaling, the result is peak-limited back into [-1, 1] rather
-      than allowed to clip, because an isolated loud sample can exceed unit
-      scale even when the chunk's RMS looked safely boostable.
+      exact case that matters -- can be over before a slow EMA ramp from a
+      neutral start ever reaches a useful gain (this was already true, and
+      already fixed, under the old RMS framing; the mechanism carries over
+      unchanged, just measuring peak instead of RMS).
+    - The gain is clamped to [1.0, max_gain]: it only tries to boost, never
+      attenuate, based on the target -- but see the ceiling below, which
+      can and does override this when the input is already loud enough on
+      its own to risk breaching the ceiling.
+    - After scaling, the result is limited to a hard ceiling strictly below
+      1.0 (`ceiling`, default 0.9) rather than allowed to approach or touch
+      1.0. This is a correctness requirement, not a nicety: the measured
+      evidence above shows output peak 1.000 corrupting the transcript even
+      when a turn was still detected. If the scaled chunk's true peak would
+      exceed the ceiling -- whether because the gain overshot or because the
+      raw input was already loud enough by itself -- gain is reduced
+      (attenuating if necessary) so the ceiling is never crossed.
     """
 
     def __init__(
         self,
-        target_rms: float,
         *,
+        target_peak: float = 0.65,
+        ceiling: float = 0.9,
         max_gain: float = 10.0,
         floor_rms: float = 0.003,
         smoothing: float = 0.9,
     ):
-        self.target_rms = target_rms
+        if not 0.0 < ceiling < 1.0:
+            raise ValueError("ceiling must be strictly between 0 and 1")
+        self.target_peak = target_peak
+        self.ceiling = ceiling
         self.max_gain = max_gain
         self.floor_rms = floor_rms
         self.smoothing = smoothing
-        self.level = target_rms  # neutral start: gain 1.0 until speech is seen
+        self.peak_level = target_peak  # neutral start: gain 1.0 until speech is seen
         self.last_gain = 1.0
         self.last_input_rms = 0.0
         # Set on every silent chunk, cleared on the next speech-like one.
@@ -101,25 +128,35 @@ class AutoGainControl:
             self._after_silence = True
             return chunk
 
+        chunk_peak = float(np.max(np.abs(chunk))) if chunk.size else 0.0
+
         if self._after_silence:
             # First speech-like chunk after a gap: snap straight to its
-            # measured level instead of easing in from the stale estimate.
+            # measured peak instead of easing in from the stale estimate.
             # A short utterance (e.g. a one-word confirmation) can be over
             # before a slow EMA ramp ever gets there -- fast attack here,
             # ordinary smoothing (slower release) below once speech is
             # already established.
-            self.level = input_rms
+            self.peak_level = max(chunk_peak, 1e-6)
             self._after_silence = False
         else:
-            self.level = self.smoothing * self.level + (1 - self.smoothing) * input_rms
+            self.peak_level = (
+                self.smoothing * self.peak_level + (1 - self.smoothing) * chunk_peak
+            )
 
-        raw_gain = self.target_rms / max(self.level, self.floor_rms)
+        raw_gain = self.target_peak / max(self.peak_level, 1e-6)
         gain = min(max(raw_gain, 1.0), self.max_gain)
 
         out = chunk * np.float32(gain)
-        peak = float(np.max(np.abs(out))) if out.size else 0.0
-        if peak > 1.0:
-            gain *= 1.0 / peak
+        true_peak = float(np.max(np.abs(out))) if out.size else 0.0
+        if true_peak > self.ceiling:
+            # Hard ceiling: never let output approach 1.0, whether that's
+            # because the target-based gain overshot or because the raw
+            # input was already loud enough on its own. This can reduce
+            # gain below 1.0 (attenuate) -- deliberately overriding the
+            # "only ever boost" rule above, because breaching the ceiling
+            # is worse than leaving already-loud audio untouched.
+            gain *= self.ceiling / true_peak
             out = chunk * np.float32(gain)
 
         self.last_gain = gain
@@ -135,6 +172,7 @@ class VoiceService:
         tts_factory: Callable[[], object] | None = None,
         agc: bool = True,
         agc_target_rms: float = 0.05,
+        agc_target_peak: float = 0.65,
     ):
         self.client = SoulXClient(soulx_url)
         self.adapter = StateAdapter()
@@ -143,8 +181,14 @@ class VoiceService:
         self._tts_factory = tts_factory
         self._t_ms = 0
         self.agc = agc
+        # `agc_target_rms` predates the switch to peak-targeted gain (see
+        # AutoGainControl's docstring for why RMS turned out to be the wrong
+        # control variable). It is kept as an accepted keyword purely for
+        # backward compatibility with existing callers/tests -- it is no
+        # longer wired into the gain calculation. Use `agc_target_peak`.
         self.agc_target_rms = agc_target_rms
-        self._agc = AutoGainControl(agc_target_rms) if agc else None
+        self.agc_target_peak = agc_target_peak
+        self._agc = AutoGainControl(target_peak=agc_target_peak) if agc else None
         # Visible per-chunk record of what AGC did, so a session can be
         # inspected after the fact to see whether AGC was active and how
         # hard it was working.
