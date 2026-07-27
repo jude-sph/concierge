@@ -41,3 +41,18 @@ def test_unequal_lengths_are_zero_padded(tmp_path):
     mix, _ = sf.read(tmp_path / "mix.wav", dtype="float32")
     assert mix.shape[0] == 3200
     assert np.allclose(mix[1600:, 1], 0.0, atol=1e-6)
+
+
+def test_context_manager_support(tmp_path):
+    """Test that SessionRecorder works as a context manager."""
+    with SessionRecorder(tmp_path) as rec:
+        rec.write_user(np.ones(1600, dtype=np.float32) * 0.5)
+        rec.write_model(np.ones(1600, dtype=np.float32) * 0.25)
+    # Files should exist after exiting context
+    assert (tmp_path / "user.wav").exists()
+    assert (tmp_path / "model.wav").exists()
+    assert (tmp_path / "mix.wav").exists()
+    # Verify contents
+    user, sr = sf.read(tmp_path / "user.wav", dtype="float32")
+    assert sr == 16000
+    assert np.allclose(user, 0.5, atol=1e-3)

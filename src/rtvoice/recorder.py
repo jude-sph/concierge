@@ -26,6 +26,41 @@ class SessionRecorder:
         )
         self._closed = False
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
+
+    def __del__(self):
+        """Defensive cleanup: close file handles if close() was not called.
+
+        Runs during garbage collection and is defensive against:
+        - Partially initialized objects
+        - Interpreter shutdown
+        - Exceptions during initialization
+        """
+        try:
+            # Guard against partially-initialized instances
+            if not hasattr(self, "_closed") or not hasattr(self, "_user_file"):
+                return
+            if not self._closed and self._user_file is not None:
+                try:
+                    self._user_file.close()
+                except Exception:
+                    pass
+            if not hasattr(self, "_model_file"):
+                return
+            if not self._closed and self._model_file is not None:
+                try:
+                    self._model_file.close()
+                except Exception:
+                    pass
+        except Exception:
+            # Swallow all exceptions during cleanup
+            pass
+
     def write_user(self, chunk: np.ndarray) -> None:
         if not self._closed:
             self._user_file.write(np.asarray(chunk, dtype=np.float32))

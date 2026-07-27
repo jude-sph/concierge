@@ -9,15 +9,17 @@ from rtvoice.tts import KokoroTTS, _resample
 class FakePipeline:
     """Mock Kokoro pipeline for testing without GPU dependencies."""
 
-    def __init__(self, num_chunks: int = 3):
+    def __init__(self, num_chunks: int = 3, base_value: float = 0.1):
         self.num_chunks = num_chunks
+        self.base_value = base_value
 
     def __call__(self, text: str, voice: str = "af_heart"):
         """Yields num_chunks audio chunks at 24 kHz."""
         for i in range(self.num_chunks):
             # Yield (speaker_id, language_id, audio)
             # Each chunk is 1000 samples at 24 kHz
-            yield (0, "a", np.ones(1000, dtype=np.float32) * (i + 1) * 0.1)
+            # Use base_value to distinguish between different streams
+            yield (0, "a", np.ones(1000, dtype=np.float32) * self.base_value)
 
 
 @pytest.mark.asyncio
@@ -74,48 +76,58 @@ async def test_stop_halts_stream_within_chunk():
 async def test_generation_token_prevents_race_condition():
     """Test that generation tokens prevent race conditions between concurrent streams.
 
-    This reproduces the bug from the coordinator review:
-    1. stream("utterance one") is running
-    2. stop() is called
-    3. stream("utterance two") is called immediately
-    4. Without generation tokens, the old generator would resume and emit both utterances
-    5. With generation tokens, the old generator exits cleanly
+    This reproduces the exact bug from the coordinator review:
+    1. Start stream(A) and pull ONE chunk (do not break)
+    2. Call stop() to invalidate stream A
+    3. Start stream(B) and collect all its chunks
+    4. Try to resume generator A - must raise StopAsyncIteration
+    5. Assert stream B contains ONLY B's values, none of A's (no interleaving)
+
+    The test uses distinguishable chunk values (0.5 for A, 0.7 for B) to detect
+    any interleaving. With the old _stopped flag implementation, this test would
+    FAIL because the old generator would resume after stop() sets the flag, then
+    stream(B) resets it to False, allowing A to continue yielding its 0.5 values.
     """
     tts = object.__new__(KokoroTTS)
-    tts._pipeline = FakePipeline(num_chunks=10)  # Long stream
+    # Pipeline for stream A yields chunks with value 0.5
+    pipeline_a = FakePipeline(num_chunks=10, base_value=0.5)
+    # Pipeline for stream B yields chunks with value 0.7
+    pipeline_b = FakePipeline(num_chunks=5, base_value=0.7)
     tts.voice = "af_heart"
     tts._generation = 0
 
-    # Track which generation each chunk came from
-    chunks_by_call = {"first": [], "second": []}
+    # Start stream A and pull one chunk
+    generator_a = tts.stream("utterance A")
+    tts._pipeline = pipeline_a
+    chunk_a = await generator_a.__anext__()
+    # Verify it's from A
+    assert np.allclose(chunk_a, 0.5, atol=1e-6), "First chunk should be from stream A (0.5)"
 
-    async def first_stream():
-        """Start first stream and collect some chunks."""
-        async for chunk in tts.stream("utterance one"):
-            chunks_by_call["first"].append(chunk)
-            await asyncio.sleep(0.001)  # Small delay to let second stream start
-            if len(chunks_by_call["first"]) >= 3:
-                break
+    # Now call stop() to invalidate this generator
+    tts.stop()
 
-    async def second_stream():
-        """Start second stream shortly after the first."""
-        await asyncio.sleep(0.002)  # Let first stream start
-        tts.stop()  # This increments generation, invalidating first stream
-        async for chunk in tts.stream("utterance two"):
-            chunks_by_call["second"].append(chunk)
+    # Start stream B and collect all its chunks
+    chunks_b = []
+    tts._pipeline = pipeline_b
+    generator_b = tts.stream("utterance B")
+    async for chunk in generator_b:
+        chunks_b.append(chunk)
 
-    # Run both streams concurrently
-    await asyncio.gather(first_stream(), second_stream())
+    # Stream B should have gotten all 5 chunks
+    assert len(chunks_b) == 5, f"Stream B should get 5 chunks, got {len(chunks_b)}"
 
-    # Both streams should get chunks
-    assert len(chunks_by_call["first"]) > 0
-    assert len(chunks_by_call["second"]) > 0
+    # Critical assertion: all of B's chunks should be 0.7 (from pipeline_b)
+    # If the old _stopped flag implementation were used, A's chunks (0.5) would
+    # interleave with B's chunks when we resume A's generator
+    for chunk in chunks_b:
+        assert np.allclose(
+            chunk, 0.7, atol=1e-6
+        ), f"Stream B chunk should be 0.7, got {chunk[0]}"
 
-    # The first stream should not have gotten all 10 chunks - it should stop early
-    # because second_stream() called stop() which incremented generation
-    assert len(chunks_by_call["first"]) < 10
-    # The second stream may get all 10 chunks since it started fresh after stop()
-    # but importantly, the generations are isolated - no interleaved audio
+    # Now try to resume generator A - it must raise StopAsyncIteration
+    # With the old implementation (shared flag), it would instead yield more 0.5 chunks
+    with pytest.raises(StopAsyncIteration):
+        await generator_a.__anext__()
 
 
 @pytest.mark.asyncio
