@@ -427,8 +427,21 @@ class Orchestrator:
                         continue
                     self.history.append({"role": "assistant", "content": text})
                     self.policy_state.speaking = True
-                    await self.voice.speak(text, uuid.uuid4().hex)
-                    self.policy_state.speaking = False
+                    try:
+                        await self.voice.speak(text, uuid.uuid4().hex)
+                    except Exception as exc:
+                        # kokoro may not be installed, or TTS may fail for any
+                        # other reason. The text is already in history above,
+                        # so the transcript is correct even with no audio --
+                        # a silent-but-correct demo beats a crashed one. This
+                        # must never propagate: on_tick (silence timeout, merge
+                        # flush) calls into here directly, outside any
+                        # gather(return_exceptions=True), so an uncaught
+                        # exception here would kill the audio socket's loop.
+                        self.log.append("tts_failed", text=text, error=repr(exc),
+                                        error_type=type(exc).__name__)
+                    finally:
+                        self.policy_state.speaking = False
 
     async def _ask_concierge(self, trigger: str) -> None:
         # Snapshot the speech generation before doing anything async. If a
@@ -454,8 +467,17 @@ class Orchestrator:
                 return
             self.history.append({"role": "assistant", "content": act.text})
             self.policy_state.speaking = True
-            await self.voice.speak(act.text, uuid.uuid4().hex)
-            self.policy_state.speaking = False
+            try:
+                await self.voice.speak(act.text, uuid.uuid4().hex)
+            except Exception as exc:
+                # See the matching comment in on_reasoner_messages: TTS being
+                # unavailable (no kokoro, no GPU) must not crash the caller.
+                # The reply text is already in history, so the transcript is
+                # right even when nothing is heard.
+                self.log.append("tts_failed", text=act.text, error=repr(exc),
+                                error_type=type(exc).__name__)
+            finally:
+                self.policy_state.speaking = False
 
     async def _abort(self, task_id: str) -> None:
         """Fire the token FIRST; notifying the reasoner is secondary and

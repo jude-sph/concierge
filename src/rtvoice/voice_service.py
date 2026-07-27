@@ -6,7 +6,7 @@ service moves to the Mac and only text crosses the wire.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable
+from typing import Awaitable, Callable, Optional
 
 import numpy as np
 
@@ -195,6 +195,12 @@ class VoiceService:
         # hard it was working.
         self.last_agc_gain = 1.0
         self.last_agc_input_rms = 0.0
+        # Optional sink for outgoing speech audio, set by whatever is playing
+        # it back live (e.g. the /audio websocket). None by default so
+        # constructing or using a VoiceService without a listener attached
+        # (every existing caller, every existing test) behaves exactly as
+        # before -- this is purely additive.
+        self.on_audio_chunk: Optional[Callable[[np.ndarray], Awaitable[None]]] = None
 
     # -- text to speech -------------------------------------------------------
     #
@@ -264,6 +270,8 @@ class VoiceService:
     async def speak(self, text: str, utterance_id: str) -> None:
         async for chunk in self.tts.stream(text):
             self.recorder.write_model(chunk)
+            if self.on_audio_chunk is not None:
+                await self.on_audio_chunk(chunk)
 
     async def stop(self) -> None:
         # Deliberately reads the private slot: stopping speech must never be

@@ -158,6 +158,67 @@ async def test_nonidle_resuming_speech_clears_the_silence_timer(tmp_path):
     assert orch.registry.all() == []   # timer was reset by NONIDLE, no forced dispatch
 
 
+class FailingVoice:
+    """Stands in for a VoiceService whose TTS is unavailable (e.g. `kokoro`
+    is not installed): speak() always raises, exactly like
+    VoiceService.speak() does when `self.tts` fails to construct."""
+
+    def __init__(self):
+        self.spoken = []
+        self.stops = 0
+
+    async def speak(self, text, utterance_id):
+        raise RuntimeError("kokoro not installed")
+
+    async def stop(self):
+        self.stops += 1
+
+
+@pytest.mark.asyncio
+async def test_tts_failure_is_caught_and_logged_on_the_bypass_path(tmp_path):
+    """Graceful degradation, bypass path (use_concierge=False, the v1
+    default): voice.speak() raising must not propagate -- the reply text is
+    already in history before speak() is attempted, so the transcript stays
+    correct even with no audio, and a clear event is logged instead of a
+    crash."""
+    orch = make(tmp_path, use_concierge=False)
+    orch.voice = FailingVoice()
+    await orch.on_reasoner_messages([
+        ReasonerMessage(kind="ack", task_id="t1", understood_as="rename"),
+        ReasonerMessage(kind="done", task_id="t1", result="renamed 47 contacts"),
+    ])
+    assert orch.history[-1] == {"role": "assistant", "content": "renamed 47 contacts"}
+    kinds = [e.kind for e in EventLog.read(orch.log.path)]
+    assert "tts_failed" in kinds
+
+
+@pytest.mark.asyncio
+async def test_tts_failure_is_caught_and_logged_via_the_concierge(tmp_path):
+    orch = make(tmp_path)
+    orch.voice = FailingVoice()
+    await orch._ask_concierge("user_turn")
+    assert orch.history[-1] == {"role": "assistant", "content": "on it"}
+    kinds = [e.kind for e in EventLog.read(orch.log.path)]
+    assert "tts_failed" in kinds
+
+
+@pytest.mark.asyncio
+async def test_tts_failure_does_not_crash_a_full_turn(tmp_path):
+    """Before this fix, voice.speak() had no try/except at all: the only
+    reason a TTS failure didn't crash the process was that _ask_concierge
+    happened to run inside on_turn_event's gather(return_exceptions=True) --
+    which does not cover every call path (on_tick's silence-timeout and
+    merge-window flushes call straight into _dispatch, outside any gather).
+    This exercises the ordinary gather-covered path and pins the new,
+    explicit behaviour: a distinct tts_failed event, not a turn_task_error."""
+    orch = make(tmp_path)
+    orch.voice = FailingVoice()
+    await orch.on_turn_event(TurnEvent(UserState.COMPLETE, "find pizza places", 0))
+    kinds = [e.kind for e in EventLog.read(orch.log.path)]
+    assert "turn_task_error" not in kinds
+    assert "tts_failed" in kinds
+
+
 @pytest.mark.asyncio
 async def test_reasoner_timeout_produces_distinct_failed_tasks(tmp_path):
     """IMPORTANT 4 regression: falling back to a fixed task_id ("unknown")
