@@ -1,3 +1,4 @@
+import asyncio
 import json
 import pytest
 from rtvoice.device import DeviceState
@@ -86,6 +87,85 @@ async def test_concierge_bypass_skips_concierge_on_a_full_turn(tmp_path):
     await orch.on_turn_event(TurnEvent(UserState.COMPLETE, "find pizza places", 0))
     assert orch.concierge.calls == []
     assert orch.voice.spoken == ["found 12 results for pizza places"]
+
+
+@pytest.mark.asyncio
+async def test_done_result_bypasses_the_concierge_even_when_it_is_enabled(tmp_path):
+    """The design: the reasoner writes facts, verbatim; the concierge writes
+    only conversational framing. A `done` fact must never be routed through
+    the concierge's ask/validate/relay round trip -- not just when
+    use_concierge=False (that was already true before this change), but
+    unconditionally, because a second model asked to relay a fact is a
+    second chance for it to invent a question instead of stating the
+    answer (the live-model failure this change removes)."""
+    orch = make(tmp_path)  # use_concierge defaults to True
+    await orch.on_reasoner_messages([
+        ReasonerMessage(kind="ack", task_id="t1", understood_as="rename"),
+        ReasonerMessage(kind="done", task_id="t1", result="renamed 47 contacts"),
+    ])
+    assert orch.voice.spoken == ["renamed 47 contacts"]
+    assert orch.concierge.calls == []
+
+
+@pytest.mark.asyncio
+async def test_confirm_required_is_spoken_exactly_as_authored(tmp_path):
+    """The other live-model failure this change removes: a concierge asked
+    to relay a destructive-write confirmation could reword it, silently
+    changing what the user believes they are agreeing to. The fact now
+    reaches the speaker unmediated, character for character."""
+    orch = make(tmp_path)
+    verbatim = "This will delete 3 messages from Marcus Webb. Confirm?"
+    await orch.on_reasoner_messages([
+        ReasonerMessage(kind="ack", task_id="t1", understood_as="delete"),
+        ReasonerMessage(kind="confirm_required", task_id="t1", verbatim_text=verbatim),
+    ])
+    assert orch.voice.spoken == [verbatim]
+    assert orch.concierge.calls == []
+
+
+@pytest.mark.asyncio
+async def test_concierge_still_called_for_a_conversational_turn_with_no_task(tmp_path):
+    """Facts bypass the concierge entirely, but its own job is untouched: a
+    turn that produces no task at all (ReasonerStub's noop path, for plain
+    chit-chat) must still reach the concierge via the ordinary "user_turn"
+    ask -- there is simply nothing for a fact-bypass to have skipped."""
+    orch = make(tmp_path)
+    await orch.on_turn_event(TurnEvent(UserState.COMPLETE, "hello, how are you", 0))
+    assert orch.registry.all() == []
+    assert orch.concierge.calls and orch.concierge.calls[0][1] == "user_turn"
+    assert orch.voice.spoken == ["on it"]  # the concierge's own ack, unaffected
+
+
+@pytest.mark.asyncio
+async def test_direct_speak_path_is_cancelled_by_stop_via_generation_counter(tmp_path):
+    """_speak_facts (the direct-speak path for reasoner facts) must be
+    guarded by the same speech-generation counter as _ask_concierge, not a
+    separate, unguarded route: a Stop() (barge-in) landing while a fact is
+    still queued behind the speak lock must prevent it from ever reaching
+    voice.spoken or history, exactly as proven for the concierge path by
+    test_stop_during_inflight_concierge_ask_prevents_stale_speech."""
+    orch = make(tmp_path)
+
+    # Hold the speak lock ourselves, standing in for another in-flight
+    # speech act (a concierge reply, or a sibling fact) still being spoken
+    # when the Stop() below fires.
+    await orch._speak_lock.acquire()
+    try:
+        speak_task = asyncio.create_task(orch.on_reasoner_messages([
+            ReasonerMessage(kind="done", task_id="t1", result="renamed 47 contacts"),
+        ]))
+        await asyncio.sleep(0)  # let it snapshot its generation and block on the lock
+
+        orch.policy_state.speaking = True
+        await orch.on_turn_event(TurnEvent(UserState.NONIDLE, "wait", 0))
+        assert orch.voice.stops == 1
+    finally:
+        orch._speak_lock.release()
+
+    await speak_task
+
+    assert orch.voice.spoken == []
+    assert all(h.get("content") != "renamed 47 contacts" for h in orch.history)
 
 
 @pytest.mark.asyncio

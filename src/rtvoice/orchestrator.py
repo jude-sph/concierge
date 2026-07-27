@@ -117,9 +117,10 @@ class Orchestrator:
         # Stop() bumps it, and an in-flight _ask_concierge that captured an
         # older value knows its reply is stale and must not speak it.
         self._speech_gen = 0
-        # Serialises the "actually call voice.speak()" critical section so two
-        # concurrent concierge replies (the top-level user_turn ask and a
-        # nested reasoner_update ask) can never have overlapping audio.
+        # Serialises the "actually call voice.speak()" critical section so a
+        # concierge reply (the top-level user_turn ask) and a directly-spoken
+        # reasoner fact (_speak_facts, below) can never have overlapping
+        # audio.
         self._speak_lock = asyncio.Lock()
 
         # Some reasoners run in-process and hold live CancellationTokens for
@@ -310,11 +311,13 @@ class Orchestrator:
                         self._merge_append(action.text, ev.t_ms)
 
             elif isinstance(action, AskConcierge):
-                # use_concierge=False must genuinely bypass the concierge on
-                # every path, not just the reasoner_update ask -- otherwise
-                # the flag can't be used to measure whether the concierge
-                # earns its place, since it would still speak filler on
-                # every ordinary turn.
+                # This is the ONLY trigger that ever reaches the concierge --
+                # reasoner facts are spoken directly by _speak_facts and never
+                # ask the concierge for anything (see on_reasoner_messages).
+                # use_concierge=False bypasses this call so the flag can be
+                # used to measure whether the concierge earns its place at
+                # all, rather than it still speaking filler on every ordinary
+                # turn.
                 if self.use_concierge:
                     concurrent.append(asyncio.create_task(self._ask_concierge(action.trigger)))
 
@@ -423,44 +426,62 @@ class Orchestrator:
         self._sync_pending_question()
         if not should_speak:
             return
-        if self.use_concierge:
-            await self._ask_concierge("reasoner_update")
-            return
-        # Bypass: speak the reasoner's verbatim text directly, without the
-        # concierge in the loop at all. Nothing can be invented because
-        # nothing is generated -- this exists so "does the concierge earn
-        # its keep" can be measured against a real baseline. Still routed
-        # through the same generation-check + speak lock as _ask_concierge
-        # so a Stop() during a bypassed reply can't leave stale audio
-        # playing or overlap with a barge-in.
+        await self._speak_facts(msgs)
+
+    async def _speak_facts(self, msgs: list[ReasonerMessage]) -> None:
+        """Speak the reasoner's own authored text directly -- no concierge in
+        the loop at all.
+
+        The design is: the reasoner writes facts, verbatim; the concierge
+        writes only conversational framing. Routing facts through a concierge
+        "relay" act asked a *second* model to reproduce the first model's
+        words, and against real models that failed both ways that matter --
+        a correct answer got replaced by a parroted-back question, and a
+        destructive-write confirmation got reworded (silently changing what
+        the user was agreeing to). Speaking `m.result`/`m.reason`/
+        `m.verbatim_text`/`m.question` straight from the ReasonerMessage means
+        nothing is generated here, so nothing can be invented -- this is the
+        only path a `done`, `failed`, `need_clarification` or
+        `confirm_required` is ever spoken on, unconditionally, whether or not
+        a concierge is configured at all. The concierge keeps its own job
+        (conversational turns, acknowledgements, its own clarifying
+        questions) via the separate "user_turn" ask in on_turn_event, which
+        this does not touch.
+
+        Still routed through the same generation-check + speak lock as
+        _ask_concierge, so a Stop() during a spoken fact can't leave stale
+        audio playing or overlap with a barge-in -- there is no unguarded
+        speech path.
+        """
         gen = self._speech_gen
         for m in msgs:
-            if m.kind in SPEAK_ON:
-                text = m.result or m.reason or m.verbatim_text or m.question
-                if not text:
+            if m.kind not in SPEAK_ON:
+                continue
+            text = m.result or m.reason or m.verbatim_text or m.question
+            if not text:
+                continue
+            async with self._speak_lock:
+                if gen != self._speech_gen:
+                    self.log.append("speak_skipped_stale",
+                                    trigger="reasoner_fact", text=text)
                     continue
-                async with self._speak_lock:
-                    if gen != self._speech_gen:
-                        self.log.append("speak_skipped_stale",
-                                        trigger="reasoner_update_bypass", text=text)
-                        continue
-                    self.history.append({"role": "assistant", "content": text})
-                    self.policy_state.speaking = True
-                    try:
-                        await self.voice.speak(text, uuid.uuid4().hex)
-                    except Exception as exc:
-                        # kokoro may not be installed, or TTS may fail for any
-                        # other reason. The text is already in history above,
-                        # so the transcript is correct even with no audio --
-                        # a silent-but-correct demo beats a crashed one. This
-                        # must never propagate: on_tick (silence timeout, merge
-                        # flush) calls into here directly, outside any
-                        # gather(return_exceptions=True), so an uncaught
-                        # exception here would kill the audio socket's loop.
-                        self.log.append("tts_failed", text=text, error=repr(exc),
-                                        error_type=type(exc).__name__)
-                    finally:
-                        self.policy_state.speaking = False
+                self.history.append({"role": "assistant", "content": text})
+                self.policy_state.speaking = True
+                try:
+                    await self.voice.speak(text, uuid.uuid4().hex)
+                except Exception as exc:
+                    # kokoro may not be installed, or TTS may fail for any
+                    # other reason. The text is already in history above,
+                    # so the transcript is correct even with no audio --
+                    # a silent-but-correct demo beats a crashed one. This
+                    # must never propagate: on_tick (silence timeout, merge
+                    # flush) calls into here directly, outside any
+                    # gather(return_exceptions=True), so an uncaught
+                    # exception here would kill the audio socket's loop.
+                    self.log.append("tts_failed", text=text, error=repr(exc),
+                                    error_type=type(exc).__name__)
+                finally:
+                    self.policy_state.speaking = False
 
     async def _ask_concierge(self, trigger: str) -> None:
         # Snapshot the speech generation before doing anything async. If a
