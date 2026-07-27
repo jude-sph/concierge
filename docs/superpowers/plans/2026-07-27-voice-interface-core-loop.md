@@ -1294,6 +1294,21 @@ def test_backchannel_does_not_stop_speech():
     assert decide(ev(UserState.BACKCHANNEL, "mm hm"), PolicyState(speaking=True)) == []
 
 
+def test_bare_yes_answering_a_pending_question_is_a_real_turn():
+    """A bare "yes" is a backchannel by wording but an ANSWER when we are holding
+    a question. Without this, confirming a destructive write with "yes" is dropped."""
+    state = PolicyState(pending_question="This will rename 47 contacts. Confirm?")
+    actions = decide(ev(UserState.BACKCHANNEL, "yes"), state)
+    assert actions == [
+        SendUtterance(text="yes"),
+        AskConcierge(trigger="user_turn"),
+    ]
+
+
+def test_backchannel_with_no_pending_question_is_still_ignored():
+    assert decide(ev(UserState.BACKCHANNEL, "mm hm"), PolicyState()) == []
+
+
 def test_nonidle_while_speaking_stops_reflexively():
     actions = decide(ev(UserState.NONIDLE, "wait"), PolicyState(speaking=True))
     assert actions == [Stop()]
@@ -1371,23 +1386,32 @@ class PolicyState:
 
 
 def decide(event: TurnEvent, state: PolicyState) -> list[Action]:
-    if event.state in (UserState.IDLE, UserState.INCOMPLETE, UserState.BACKCHANNEL):
+    if event.state in (UserState.IDLE, UserState.INCOMPLETE):
         # INCOMPLETE: the user paused mid-sentence. Wait. This is the point.
-        # BACKCHANNEL: "mm hm" is not a turn grab. Keep speaking.
         return []
 
-    if event.state == UserState.NONIDLE:
+    if event.state is UserState.NONIDLE:
         # Barge-in is reflexive, unless we are holding a question, in which
         # case speech is the answer to it rather than an interruption.
         if state.speaking and state.pending_question is None:
             return [Stop()]
         return []
 
-    if event.state == UserState.COMPLETE:
+    # A bare "yes"/"ok" reads as a backchannel by wording, but it is a real
+    # answer when we are holding a question. Disambiguate here, in the layer
+    # that has the dialogue context - the adapter deliberately does not.
+    answers_question = (
+        event.state is UserState.BACKCHANNEL and state.pending_question is not None
+    )
+    if event.state is UserState.BACKCHANNEL and not answers_question:
+        # "mm hm" mid-utterance is not a turn grab. Keep speaking.
+        return []
+
+    if event.state is UserState.COMPLETE or answers_question:
         actions: list[Action] = []
         if state.speaking:
             actions.append(Stop())
-        # Every finalised utterance goes to the reasoner — it is the gatekeeper.
+        # Every finalised utterance goes to the reasoner - it is the gatekeeper.
         # The concierge responds in parallel, never waiting for it.
         actions.append(SendUtterance(text=event.transcript))
         actions.append(AskConcierge(trigger="user_turn"))
