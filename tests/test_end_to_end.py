@@ -1,11 +1,15 @@
+import asyncio
 import json
 
 import pytest
 from fakes import FakeConcierge, FakeVoice
 
+from rtvoice.cancellation import CancellationToken
+from rtvoice.concierge import SpeechAct
 from rtvoice.device import DeviceState
 from rtvoice.events import EventLog
 from rtvoice.orchestrator import Orchestrator
+from rtvoice.protocol import ReasonerMessage
 from rtvoice.reasoner_stub import ReasonerStub
 from rtvoice.registry import TaskStatus
 from rtvoice.states import TurnEvent, UserState
@@ -99,3 +103,217 @@ async def test_bare_yes_backchannel_while_speaking_confirms_destructive_write(or
 
     assert orch.registry.get(tid).status == TaskStatus.DONE
     assert [c["first_name"] for c in orch.device.query("contacts")] == ["Hans", "Hans"]
+
+
+# --- Coordinator fix-round tests -------------------------------------------
+#
+# Round 1 review found two real defects in the Task 12 implementation:
+#
+# 1. CRITICAL: Orchestrator.tokens was declared but never populated, so
+#    _abort() could never actually fire a live CancellationToken -- it was
+#    silently a no-op, and cancellation depended entirely on the reasoner
+#    receiving and processing a fire-and-forget "cancel" message. Fixed by
+#    sharing a single tokens dict between the orchestrator and any reasoner
+#    that exposes one (ReasonerStub now does), with ReasonerStub._confirm()
+#    registering its live token there.
+#
+# 2. IMPORTANT: making SendUtterance/AskConcierge run concurrently (the fix
+#    for the pipeline bug, above) opened a race: two _ask_concierge() calls
+#    can be in flight at once, so (a) a Stop() from a later turn didn't
+#    prevent an already-in-flight, now-stale reply from being spoken, and
+#    (b) two concurrent replies could interleave audio. Fixed with a speech
+#    generation counter (checked right before speaking) plus a speak lock.
+
+
+class SlowReasoner:
+    """Test double: mimics a reasoner in the middle of a slow destructive
+    write. It registers a live CancellationToken in the shared `tokens` dict
+    (exactly as ReasonerStub._confirm does) and then blocks indefinitely --
+    standing in for a device.update() loop that has not returned yet. It also
+    stalls on "cancel" messages, so a test can prove that Orchestrator._abort
+    cancels the live token immediately, before this reasoner has any chance
+    to process that message.
+    """
+
+    def __init__(self, *, tokens=None):
+        self.tokens = tokens if tokens is not None else {}
+        self.write_started = asyncio.Event()
+        self.cancel_processed = False
+
+    async def handle(self, msg):
+        if msg.kind == "utterance":
+            return [
+                ReasonerMessage(kind="ack", task_id="slow-task",
+                                understood_as="slow destructive op"),
+                ReasonerMessage(kind="confirm_required", task_id="slow-task",
+                                verbatim_text="This will do something destructive. Confirm?"),
+            ]
+        if msg.kind == "clarification_answer":
+            token = CancellationToken()
+            self.tokens[msg.task_id] = token
+            self.write_started.set()
+            try:
+                await asyncio.sleep(10)  # stands in for a write that never finishes
+            except asyncio.CancelledError:
+                pass
+            return [ReasonerMessage(kind="noop")]
+        if msg.kind == "cancel":
+            await asyncio.sleep(10)  # the reasoner never gets around to this
+            self.cancel_processed = True
+            return [ReasonerMessage(kind="failed", task_id=msg.task_id, reason="cancelled")]
+        return [ReasonerMessage(kind="noop")]
+
+
+@pytest.mark.asyncio
+async def test_abort_cancels_a_live_token_without_the_reasoner_processing_cancel(tmp_path):
+    state = tmp_path / "device_state.json"
+    state.write_text(json.dumps({"contacts": [{"id": 1, "first_name": "Sarah"}]}))
+    device = DeviceState(state, tmp_path / "journal.jsonl")
+    reasoner = SlowReasoner()
+    orch = Orchestrator(
+        reasoner=reasoner, concierge=FakeConcierge(), voice=FakeVoice(),
+        log=EventLog(tmp_path / "events.jsonl"), device=device,
+    )
+    # The orchestrator must have bound reasoner.tokens to its own dict.
+    assert orch.tokens is reasoner.tokens
+
+    await orch.on_turn_event(TurnEvent(UserState.COMPLETE, "do something destructive", 0))
+    tid = "slow-task"
+    assert orch.registry.get(tid).status == TaskStatus.AWAITING_CONFIRM
+
+    # Confirm it: the (fake) reasoner registers a live token, then blocks --
+    # standing in for a real, still-running destructive write.
+    confirm_task = asyncio.create_task(
+        orch.on_turn_event(TurnEvent(UserState.COMPLETE, "yes do it", 1)))
+    await asyncio.wait_for(reasoner.write_started.wait(), timeout=1)
+
+    token = orch.tokens[tid]
+    assert token.cancelled is False
+
+    await orch._abort(tid)
+
+    # Cancelled synchronously, by direct reference to the shared token --
+    # with no dependency on the fire-and-forget "cancel" OrchestratorMessage
+    # ever being delivered or processed.
+    assert token.cancelled is True
+    assert reasoner.cancel_processed is False
+
+    # Cleanup: cancel the still-pending background tasks this test spawned.
+    pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    for t in pending:
+        t.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+
+
+class SlowConcierge:
+    """Concierge double whose respond() takes a controllable amount of time,
+    so a test can trigger a Stop() while a reply is still in flight."""
+
+    def __init__(self, delay: float = 0.05):
+        self.delay = delay
+        self.calls = 0
+
+    async def respond(self, registry, history, trigger):
+        self.calls += 1
+        await asyncio.sleep(self.delay)
+        return SpeechAct(act="acknowledge", text="on it")
+
+
+@pytest.mark.asyncio
+async def test_stop_during_inflight_concierge_ask_prevents_stale_speech(tmp_path):
+    state = tmp_path / "device_state.json"
+    state.write_text(json.dumps({"contacts": []}))
+    device = DeviceState(state, tmp_path / "journal.jsonl")
+    orch = Orchestrator(
+        reasoner=ReasonerStub(device, latency_ms=0),
+        concierge=SlowConcierge(delay=0.05),
+        voice=FakeVoice(),
+        log=EventLog(tmp_path / "events.jsonl"),
+        device=device,
+    )
+
+    ask_task = asyncio.create_task(orch._ask_concierge("reasoner_update"))
+    await asyncio.sleep(0)  # let _ask_concierge capture its generation and start respond()
+
+    # A barge-in on a later turn stops speech while the concierge is still
+    # composing an earlier reply.
+    orch.policy_state.speaking = True
+    await orch.on_turn_event(TurnEvent(UserState.NONIDLE, "wait", 0))
+    assert orch.voice.stops == 1
+
+    await ask_task
+
+    # The stale reply must never have been spoken (nor recorded in history).
+    assert orch.voice.spoken == []
+    assert all(h.get("content") != "on it" for h in orch.history)
+
+
+class RecordingVoice:
+    """Voice double that records the peak number of concurrent speak() calls,
+    to prove the speak lock actually serialises audio."""
+
+    def __init__(self, delay: float = 0.02):
+        self.delay = delay
+        self._active = 0
+        self.max_concurrent = 0
+        self.spoken = []
+        self.stops = 0
+
+    async def speak(self, text, utterance_id):
+        self._active += 1
+        self.max_concurrent = max(self.max_concurrent, self._active)
+        await asyncio.sleep(self.delay)
+        self.spoken.append(text)
+        self._active -= 1
+
+    async def stop(self):
+        self.stops += 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_concierge_asks_do_not_interleave_speech(tmp_path):
+    state = tmp_path / "device_state.json"
+    state.write_text(json.dumps({"contacts": []}))
+    device = DeviceState(state, tmp_path / "journal.jsonl")
+    voice = RecordingVoice(delay=0.02)
+    orch = Orchestrator(
+        reasoner=ReasonerStub(device, latency_ms=0),
+        concierge=FakeConcierge(),
+        voice=voice,
+        log=EventLog(tmp_path / "events.jsonl"),
+        device=device,
+    )
+
+    await asyncio.gather(
+        orch._ask_concierge("user_turn"),
+        orch._ask_concierge("reasoner_update"),
+    )
+
+    assert voice.max_concurrent == 1
+    assert len(voice.spoken) == 2
+
+
+@pytest.mark.asyncio
+async def test_one_branch_raising_does_not_orphan_its_sibling_and_is_logged(tmp_path):
+    state = tmp_path / "device_state.json"
+    state.write_text(json.dumps({"contacts": []}))
+    device = DeviceState(state, tmp_path / "journal.jsonl")
+
+    class ExplodingReasoner:
+        async def handle(self, msg):
+            raise RuntimeError("boom")
+
+    concierge = FakeConcierge()
+    orch = Orchestrator(
+        reasoner=ExplodingReasoner(), concierge=concierge, voice=FakeVoice(),
+        log=EventLog(tmp_path / "events.jsonl"), device=device,
+    )
+
+    # decide() returns [SendUtterance, AskConcierge] together for a COMPLETE
+    # turn; the reasoner branch raises, but the concierge branch must still
+    # run to completion rather than being orphaned.
+    await orch.on_turn_event(TurnEvent(UserState.COMPLETE, "hello", 0))
+
+    assert len(concierge.calls) == 1  # the sibling branch was not orphaned
+    kinds = [e.kind for e in EventLog.read(orch.log.path)]
+    assert "turn_task_error" in kinds

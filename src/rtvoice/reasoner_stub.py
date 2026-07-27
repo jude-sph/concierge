@@ -29,11 +29,25 @@ _SEARCH = re.compile(r"(?:find|search for)\s+(.+)", re.I)
 
 
 class ReasonerStub:
-    def __init__(self, device: DeviceState, latency_ms: int = 0) -> None:
+    def __init__(
+        self,
+        device: DeviceState,
+        latency_ms: int = 0,
+        *,
+        tokens: dict[str, CancellationToken] | None = None,
+    ) -> None:
         self.device = device
         self.latency_ms = latency_ms
         self._pending: dict[str, dict] = {}
         self._tokens: dict[str, CancellationToken] = {}
+        # Shared with the orchestrator (which binds its own dict here after
+        # construction) so a live token can be fired by direct reference,
+        # with no dependency on any message being sent or received. Kept
+        # separate from `_tokens` (still used for this stub's own bookkeeping,
+        # e.g. `_cancel`'s lookup) so a caller-supplied dict is never
+        # unexpectedly mutated with entries the caller doesn't care about
+        # beyond what's explicitly published here.
+        self.tokens: dict[str, CancellationToken] = tokens if tokens is not None else {}
 
     async def handle(self, msg: OrchestratorMessage) -> list[ReasonerMessage]:
         if self.latency_ms:
@@ -92,25 +106,34 @@ class ReasonerStub:
         if re.search(r"\b(no|nope|don't|dont|do not|not|never mind|nevermind|cancel|stop|wait|hold on|forget it)\b", answer, re.I):
             self.device.rollback()
             self._tokens.pop(task_id, None)
+            self.tokens.pop(task_id, None)
             return [ReasonerMessage(kind="failed", task_id=task_id, reason="cancelled by user")]
 
         # Only commit if affirmative word is present
         if not re.search(r"\b(yes|yeah|yep|do it|go ahead|confirm|ok|okay)\b", answer, re.I):
             self.device.rollback()
             self._tokens.pop(task_id, None)
+            self.tokens.pop(task_id, None)
             return [ReasonerMessage(kind="failed", task_id=task_id, reason="cancelled by user")]
 
         token = CancellationToken()
         self._tokens[task_id] = token
+        # Published to the shared registry the orchestrator holds a reference
+        # to, so a concurrent _abort() can fire this exact token in-process,
+        # synchronously -- without waiting for (or requiring) a "cancel"
+        # message to ever be sent, delivered, or processed.
+        self.tokens[task_id] = token
         try:
             n = self.device.update("contacts", {"first_name": plan["name"]}, token=token)
             self.device.commit()
         except Exception:
             self.device.rollback()
             self._tokens.pop(task_id, None)
+            self.tokens.pop(task_id, None)
             return [ReasonerMessage(kind="failed", task_id=task_id, reason="stopped partway")]
 
         self._tokens.pop(task_id, None)
+        self.tokens.pop(task_id, None)
         return [ReasonerMessage(kind="done", task_id=task_id,
                                 result=f"renamed {n} contacts to {plan['name']}")]
 
@@ -120,6 +143,7 @@ class ReasonerStub:
         if task_id in self._tokens:
             self._tokens[task_id].cancel()
             self._tokens.pop(task_id, None)
+        self.tokens.pop(task_id, None)
         was_removed = self._pending.pop(task_id or "", None) is not None
 
         # Only rollback if there was an uncommitted task

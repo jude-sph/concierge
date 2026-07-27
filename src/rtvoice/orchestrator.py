@@ -34,6 +34,23 @@ class Orchestrator:
         self.tokens: dict[str, CancellationToken] = {}
         self._seq = 0
 
+        # Speech generation counter (same pattern as tts.py's KokoroTTS): every
+        # Stop() bumps it, and an in-flight _ask_concierge that captured an
+        # older value knows its reply is stale and must not speak it.
+        self._speech_gen = 0
+        # Serialises the "actually call voice.speak()" critical section so two
+        # concurrent concierge replies (the top-level user_turn ask and a
+        # nested reasoner_update ask) can never have overlapping audio.
+        self._speak_lock = asyncio.Lock()
+
+        # Some reasoners run in-process and hold live CancellationTokens for
+        # work they're doing (e.g. ReasonerStub mid-write). If the reasoner
+        # exposes a `tokens` dict, bind it to our own so _abort can fire a
+        # token by direct reference -- correctness must not depend on the
+        # reasoner ever receiving or processing a "cancel" message.
+        if hasattr(reasoner, "tokens"):
+            reasoner.tokens = self.tokens
+
     def _next_seq(self) -> int:
         self._seq += 1
         return self._seq
@@ -55,6 +72,7 @@ class Orchestrator:
             if isinstance(action, Stop):
                 await self.voice.stop()
                 self.policy_state.speaking = False
+                self._speech_gen += 1
                 self.log.append("tts_stopped")
 
             elif isinstance(action, SendUtterance):
@@ -65,7 +83,15 @@ class Orchestrator:
                 concurrent.append(asyncio.create_task(self._ask_concierge(action.trigger)))
 
         if concurrent:
-            await asyncio.gather(*concurrent)
+            # return_exceptions=True: one branch raising must not leave its
+            # sibling running orphaned (gather would otherwise still wait for
+            # it, but a plain gather re-raises and abandons bookkeeping around
+            # it). Log failures instead of swallowing them silently.
+            results = await asyncio.gather(*concurrent, return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException):
+                    self.log.append("turn_task_error",
+                                    error=repr(result), error_type=type(result).__name__)
 
     async def _dispatch(self, text: str) -> None:
         awaiting = [t for t in self.registry.all()
@@ -98,6 +124,12 @@ class Orchestrator:
             await self._ask_concierge("reasoner_update")
 
     async def _ask_concierge(self, trigger: str) -> None:
+        # Snapshot the speech generation before doing anything async. If a
+        # Stop() (barge-in from a later turn) bumps it while we're waiting on
+        # the concierge or on the speak lock, this reply is stale by the time
+        # we'd speak it and must be dropped rather than played over -- or
+        # after -- whatever superseded it.
+        gen = self._speech_gen
         act = await self.concierge.respond(self.registry, self.history, trigger)
         self.log.append("concierge_act", act=act.act, cites=act.cites, text=act.text,
                         violations=getattr(self.concierge, "violations", 0))
@@ -106,7 +138,13 @@ class Orchestrator:
             await self._abort(act.cites)
             return
 
-        if act.text:
+        if not act.text:
+            return
+
+        async with self._speak_lock:
+            if gen != self._speech_gen:
+                self.log.append("speak_skipped_stale", trigger=trigger, text=act.text)
+                return
             self.history.append({"role": "assistant", "content": act.text})
             self.policy_state.speaking = True
             await self.voice.speak(act.text, uuid.uuid4().hex)
