@@ -50,8 +50,6 @@ def test_update_respects_where(dev):
 
 
 def test_cancellation_stops_mid_update_and_rolls_back(dev):
-    token = CancellationToken()
-
     class CancelAfterOne(CancellationToken):
         def __init__(self):
             super().__init__()
@@ -64,6 +62,12 @@ def test_cancellation_stops_mid_update_and_rolls_back(dev):
 
     with pytest.raises(Cancelled):
         dev.update("contacts", {"first_name": "Hans"}, token=CancelAfterOne())
+
+    # Verify ordering: exactly one row should be mutated before cancellation
+    working_names = [c["first_name"] for c in dev.query("contacts")]
+    assert working_names == ["Hans", "Marcus", "Priya"], \
+        "Cancellation test must verify order: token.check() happens BEFORE mutation"
+
     dev.rollback()
     dev.commit()
     assert [c["first_name"] for c in dev.query("contacts")] == ["Sarah", "Marcus", "Priya"]
@@ -75,3 +79,39 @@ def test_journal_records_every_write(dev):
     entries = [json.loads(l) for l in dev.journal_path.read_text().splitlines() if l.strip()]
     assert any(e["op"] == "update" and e["table"] == "contacts" for e in entries)
     assert any(e["op"] == "commit" for e in entries)
+
+
+def test_query_returns_deep_copies(dev):
+    """Mutations of query results must not affect subsequent queries."""
+    result = dev.query("contacts")
+    result[0]["first_name"] = "MUTATED"
+    # Re-query should show original data, not the mutation
+    requeried = dev.query("contacts")
+    assert requeried[0]["first_name"] == "Sarah", \
+        "query() must return deep copies, not live references"
+
+
+def test_journal_records_cancelled_update(dev):
+    """Cancelled updates must be journaled with partial row count and cancelled flag."""
+    class CancelAfterOne(CancellationToken):
+        def __init__(self):
+            super().__init__()
+            self.n = 0
+
+        def check(self):
+            self.n += 1
+            if self.n > 1:
+                raise Cancelled()
+
+    with pytest.raises(Cancelled):
+        dev.update("contacts", {"first_name": "Hans"}, token=CancelAfterOne())
+
+    entries = [json.loads(l) for l in dev.journal_path.read_text().splitlines() if l.strip()]
+    # Should have a journal entry for the update, marked as cancelled, with rows=1
+    cancelled_update = next(
+        (e for e in entries if e["op"] == "update" and e.get("cancelled")),
+        None
+    )
+    assert cancelled_update is not None, "Cancelled update must be journaled"
+    assert cancelled_update["rows"] == 1, "Journal must record how many rows were changed before cancellation"
+    assert cancelled_update["cancelled"] is True

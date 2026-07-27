@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import copy
 import json
+import os
+import tempfile
 import time
 from pathlib import Path
 
-from .cancellation import CancellationToken
+from .cancellation import Cancelled, CancellationToken
 
 
 class DeviceState:
@@ -33,7 +35,7 @@ class DeviceState:
         return where is None or all(row.get(k) == v for k, v in where.items())
 
     def query(self, table: str, where: dict | None = None) -> list[dict]:
-        return [r for r in self._working.get(table, []) if self._matches(r, where)]
+        return [copy.deepcopy(r) for r in self._working.get(table, []) if self._matches(r, where)]
 
     def update(
         self,
@@ -44,20 +46,35 @@ class DeviceState:
     ) -> int:
         """Stage an update. Raises Cancelled if the token fires mid-loop."""
         n = 0
-        for row in self._working.get(table, []):
-            if token is not None:
-                token.check()
-            if self._matches(row, where):
-                row.update(set_fields)
-                n += 1
-        self._journal("update", table=table, set=set_fields, where=where, rows=n)
-        return n
+        try:
+            for row in self._working.get(table, []):
+                if token is not None:
+                    token.check()
+                if self._matches(row, where):
+                    row.update(set_fields)
+                    n += 1
+            self._journal("update", table=table, set=set_fields, where=where, rows=n)
+            return n
+        except Cancelled:
+            self._journal("update", table=table, set=set_fields, where=where, rows=n, cancelled=True)
+            raise
 
     def commit(self) -> None:
         self._committed = copy.deepcopy(self._working)
-        self.state_path.write_text(
-            json.dumps(self._committed, indent=2), encoding="utf-8"
-        )
+        # Atomic write: write to temp file in same directory, then replace.
+        # os.replace() is atomic on POSIX systems, preventing partial-file corruption on crash.
+        fd, temp_path = tempfile.mkstemp(dir=self.state_path.parent, text=True)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(self._committed, indent=2))
+            os.replace(temp_path, self.state_path)
+        except Exception:
+            # Clean up temp file on error
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+            raise
         self._journal("commit")
 
     def rollback(self) -> None:
