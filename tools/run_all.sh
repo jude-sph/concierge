@@ -15,4 +15,9 @@ vllm serve Qwen/Qwen3-4B  --port 8001 --gpu-memory-utilization 0.25 \
 #      --max-model-len 8192 &
 
 cd ~/rtvoice
-uv run uvicorn rtvoice.orchestrator:app --port 8003 --host 127.0.0.1
+# --factory: the app is built by create_default_app() rather than at import
+# time, so importing the module has no filesystem or network side effects.
+uv run uvicorn rtvoice.orchestrator:create_default_app --factory --port 8003 --host 127.0.0.1
+
+# Drive the loop from a WAV instead of a browser:
+#   uv run python tools/audio_client.py <16khz-mono.wav> --mute --no-concierge

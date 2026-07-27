@@ -400,25 +400,44 @@ def create_app(orch: Orchestrator) -> "FastAPI":
     return app
 
 
-def _default_app():
+def build_default_orchestrator(session_dir=None) -> Orchestrator:
+    """The standard wiring: journaled device, stub reasoner, real concierge.
+
+    Shared by the HTTP app and by tools/audio_client.py so there is one
+    definition of "the system", not two that drift.
+    """
     import os
     from pathlib import Path
 
-    from .device import DeviceState
     from .concierge import Concierge
+    from .device import DeviceState
     from .reasoner_stub import ReasonerStub
     from .voice_service import VoiceService
 
-    session = Path("sessions") / os.environ.get("SESSION_ID", "dev")
-    device = DeviceState("fixtures/device_state.json", session / "device_journal.jsonl")
+    session = Path(session_dir) if session_dir is not None else (
+        Path("sessions") / os.environ.get("SESSION_ID", "dev"))
+    device = DeviceState(
+        os.environ.get("DEVICE_STATE", "fixtures/device_state.json"),
+        session / "device_journal.jsonl",
+    )
     log = EventLog(session / "events.jsonl")
-    voice = VoiceService(session)
+    voice = VoiceService(session, os.environ.get("SOULX_URL", "ws://localhost:8000/turn"))
     concierge = Concierge(base_url=os.environ.get("CONCIERGE_URL", "http://localhost:8001/v1"))
-    orch = Orchestrator(
+    return Orchestrator(
         reasoner=ReasonerStub(device, latency_ms=int(os.environ.get("REASONER_LATENCY_MS", "0"))),
         concierge=concierge, voice=voice, log=log, device=device,
     )
-    return create_app(orch)
 
 
-app = _default_app()
+def create_default_app() -> "FastAPI":
+    """ASGI factory.
+
+    This used to run at import time as `app = _default_app()`, so merely
+    importing this module built a device, opened an event log and created
+    session directories under whatever the current working directory happened
+    to be -- including during test collection. Behind a factory, importing the
+    module has no filesystem or network side effects.
+
+    Serve it with:  uvicorn rtvoice.orchestrator:create_default_app --factory
+    """
+    return create_app(build_default_orchestrator())
