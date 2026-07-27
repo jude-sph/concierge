@@ -122,6 +122,46 @@ async def test_speak_uses_the_lazily_built_tts_and_records_it(tmp_path):
         voice.close()
 
 
+def test_model_wav_is_recorded_at_the_rate_tts_actually_produces(tmp_path):
+    """Pins that the recorder's declared rate for model.wav matches the rate
+    synthesized speech is actually produced at (Kokoro's native 24 kHz, now
+    that TTS output is played back unresampled -- see tts.OUTPUT_SAMPLE_RATE)
+    rather than a hardcoded assumption left over from when it was downsampled
+    to 16 kHz. A mismatch here means every recorded reply replays pitch-
+    shifted."""
+    import soundfile as sf
+
+    from rtvoice.tts import OUTPUT_SAMPLE_RATE
+
+    voice = VoiceService(tmp_path, tts_factory=FakeTTS)
+    try:
+        assert voice.recorder.model_sample_rate == OUTPUT_SAMPLE_RATE
+    finally:
+        voice.close()
+
+    _, model_sr = sf.read(tmp_path / "model.wav", dtype="float32")
+    assert model_sr == OUTPUT_SAMPLE_RATE
+
+
+@pytest.mark.asyncio
+async def test_model_wav_rate_follows_an_explicit_tts_sample_rate_override(tmp_path):
+    """A caller supplying a `tts_factory` that produces audio at some other
+    rate must be able to say so, and have the recorder honor it -- the
+    recorder is constructed eagerly (before `tts` is ever built), so this
+    has to be settable at construction time rather than inferred later."""
+    import soundfile as sf
+
+    voice = VoiceService(tmp_path, tts_factory=FakeTTS, tts_sample_rate=8000)
+    try:
+        assert voice.recorder.model_sample_rate == 8000
+        await voice.speak("hello", "u1")
+    finally:
+        voice.close()
+
+    _, model_sr = sf.read(tmp_path / "model.wav", dtype="float32")
+    assert model_sr == 8000
+
+
 def test_missing_kokoro_raises_a_clear_error_rather_than_an_obscure_one(tmp_path,
                                                                        monkeypatch):
     """`kokoro` is a GPU dependency that is deliberately not installed here and

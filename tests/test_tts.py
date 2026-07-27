@@ -32,8 +32,11 @@ async def test_resample_24k_to_16k():
 
 
 @pytest.mark.asyncio
-async def test_stream_yields_resampled_chunks():
-    """Test that stream yields chunks resampled to 16 kHz."""
+async def test_stream_yields_native_rate_chunks_unresampled():
+    """`stream()` no longer resamples its output at all: Kokoro's 24 kHz is
+    also the playback rate now (see OUTPUT_SAMPLE_RATE), so what comes out of
+    the pipeline goes straight to the caller, unmodified -- no resampling
+    means no resampling artifacts."""
     tts = object.__new__(KokoroTTS)
     tts._pipeline = FakePipeline(num_chunks=3)
     tts.voice = "af_heart"
@@ -45,10 +48,10 @@ async def test_stream_yields_resampled_chunks():
 
     # Should get 3 chunks (from FakePipeline)
     assert len(chunks) == 3
-    # Each chunk resampled from 1000 24kHz to ~667 16kHz
     assert all(isinstance(c, np.ndarray) for c in chunks)
     assert all(c.dtype == np.float32 for c in chunks)
-    assert all(len(c) in [666, 667] for c in chunks)  # Approximate due to rounding
+    # Native length preserved exactly: 1000 samples in, 1000 samples out.
+    assert all(len(c) == 1000 for c in chunks)
 
 
 @pytest.mark.asyncio

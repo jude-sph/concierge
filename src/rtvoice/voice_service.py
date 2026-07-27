@@ -13,6 +13,7 @@ import numpy as np
 from .recorder import SessionRecorder
 from .soulx_client import CHUNK_SAMPLES, SAMPLE_RATE, SoulXClient
 from .states import StateAdapter, TurnEvent
+from .tts import OUTPUT_SAMPLE_RATE as TTS_OUTPUT_SAMPLE_RATE
 
 CHUNK_MS = int(CHUNK_SAMPLES / SAMPLE_RATE * 1000)
 
@@ -174,10 +175,23 @@ class VoiceService:
         agc: bool = False,
         agc_target_rms: float = 0.05,
         agc_target_peak: float = 0.65,
+        # The rate synthesized speech is actually produced at. Defaults to
+        # Kokoro's native rate (see tts.OUTPUT_SAMPLE_RATE) because that is
+        # now what gets played back -- TTS output is no longer downsampled
+        # to the 16 kHz the *input* path needs. Recorded here, at
+        # construction, rather than read off `self.tts` later: the recorder
+        # is created eagerly and `tts` is built lazily on first use (it must
+        # not require a GPU just to construct a VoiceService), so the rate
+        # the recorder tags model.wav with has to be known up front. Override
+        # this if a `tts_factory` produces audio at some other rate.
+        tts_sample_rate: int = TTS_OUTPUT_SAMPLE_RATE,
     ):
         self.client = SoulXClient(soulx_url)
         self.adapter = StateAdapter()
-        self.recorder = SessionRecorder(session_dir)
+        self.tts_sample_rate = tts_sample_rate
+        self.recorder = SessionRecorder(
+            session_dir, user_sample_rate=SAMPLE_RATE, model_sample_rate=tts_sample_rate
+        )
         self._tts = None
         self._tts_factory = tts_factory
         self._t_ms = 0

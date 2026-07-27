@@ -538,6 +538,16 @@ async function onInjectSubmit(e) {
 // alone is not reliable across browsers, but MediaStreamSourceNode always
 // resamples the track to the context's rate). The worklet just chunks
 // whatever it receives into fixed 2560-sample (160ms) frames.
+//
+// Playback is a different rate: synthesized speech now arrives over the wire
+// at Kokoro's native PLAYBACK_SAMPLE_RATE (see rtvoice/tts.py's
+// OUTPUT_SAMPLE_RATE, which this must match), not the 16 kHz the mic path
+// uses. That is fine even though the context itself runs at 16 kHz --
+// AudioBuffer's sample rate is independent of the context's, and
+// AudioBufferSourceNode resamples to the context's rate on playback. What
+// matters is constructing the buffer at the rate the bytes actually are, or
+// every reply plays back pitch-shifted and at the wrong speed.
+const PLAYBACK_SAMPLE_RATE = 24000;
 
 const WORKLET_SOURCE = `
 class PCMChunker extends AudioWorkletProcessor {
@@ -581,7 +591,7 @@ function playback(arrayBuffer) {
   if (!audioCtx) return;
   const floatData = new Float32Array(arrayBuffer);
   if (!floatData.length) return;
-  const buf = audioCtx.createBuffer(1, floatData.length, 16000);
+  const buf = audioCtx.createBuffer(1, floatData.length, PLAYBACK_SAMPLE_RATE);
   buf.copyToChannel(floatData, 0);
   const src = audioCtx.createBufferSource();
   src.buffer = buf;
