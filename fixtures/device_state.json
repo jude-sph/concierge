@@ -1,0 +1,15 @@
+{
+  "contacts": [
+    {"id": 1, "first_name": "Sarah",  "last_name": "Chen",    "group": "work"},
+    {"id": 2, "first_name": "Marcus", "last_name": "Webb",    "group": "work"},
+    {"id": 3, "first_name": "Priya",  "last_name": "Nair",    "group": "family"},
+    {"id": 4, "first_name": "Tom",    "last_name": "Okafor",  "group": "friends"}
+  ],
+  "messages": [
+    {"id": 1, "to": "Sarah Chen", "body": "running late", "sent": "2026-07-26"}
+  ],
+  "calendar": [
+    {"id": 1, "title": "standup", "when": "2026-07-28T09:00"}
+  ],
+  "places": []
+}
