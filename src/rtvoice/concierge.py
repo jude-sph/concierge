@@ -32,7 +32,7 @@ Reply with a single JSON object and nothing else:
   {"act": "acknowledge", "text": "..."}   brief filler while work happens
   {"act": "relay", "cites": "<task_id>", "text": "..."}  report a result
   {"act": "ask", "text": "..."}           ask the user something
-  {"act": "abort", "cites": "<task_id>"}  user clearly wants a task stopped now
+  {"act": "abort", "cites": "<task_id>"}  user clearly wants a currently-active task stopped
   {"act": "chat", "text": "..."}          ordinary conversation
 """
 
@@ -61,7 +61,9 @@ def validate_act(act: SpeechAct, registry: TaskRegistry) -> tuple[bool, str]:
         if registry.get(act.cites) is None:
             return False, f"unknown task id: {act.cites}"
         span = registry.verbatim_span(act.cites)
-        if span and span not in act.text:
+        if not span:
+            return False, f"no fact recorded yet for task {act.cites}"
+        if span not in act.text:
             return False, f"relay must contain the verbatim span: {span!r}"
     if act.act == "abort":
         if not act.cites or act.cites not in registry.live_ids():
@@ -70,6 +72,14 @@ def validate_act(act: SpeechAct, registry: TaskRegistry) -> tuple[bool, str]:
 
 
 class Concierge:
+    """Async LLM client for generating validated speech acts.
+
+    Attributes:
+        violations: Count of invalid speech act generations (not turns). Incremented
+            each time a model generation fails schema validation. A single turn can
+            contribute up to 2 to this counter (initial attempt + one re-prompt before
+            fallback). Use this metric to track generation quality, not turn success rate.
+    """
     def __init__(
         self,
         base_url: str = "http://localhost:8001/v1",
@@ -79,7 +89,7 @@ class Concierge:
         self.base_url = base_url
         self.model = model
         self._client = httpx.AsyncClient(timeout=timeout)
-        self.violations = 0
+        self.violations = 0  # invalid generations, not turns
 
     async def _complete(self, messages: list[dict]) -> SpeechAct:
         resp = await self._client.post(

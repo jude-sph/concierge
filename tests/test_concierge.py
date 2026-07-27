@@ -61,3 +61,30 @@ def test_abort_requires_a_live_task():
     assert ok
     ok, err = validate_act(SpeechAct(act="abort", cites="ghost"), r)
     assert not ok
+
+
+def test_relay_citing_pending_task_requires_fact():
+    """A relay citing a task that is only ack'd (PENDING) has no fact to relay yet."""
+    r = TaskRegistry()
+    r.apply(ReasonerMessage(kind="ack", task_id="t1", understood_as="rename contacts"))
+    # t1 is pending; no done/confirm_required/failed message
+    ok, err = validate_act(
+        SpeechAct(act="relay", text="Renaming your contacts now", cites="t1"),
+        r,
+    )
+    assert not ok
+    assert "fact recorded yet" in err or "no fact" in err
+
+
+def test_relay_citing_running_task_requires_fact():
+    """A relay citing a task that is only progress'd (RUNNING) has no fact to relay yet."""
+    r = TaskRegistry()
+    r.apply(ReasonerMessage(kind="ack", task_id="t1", understood_as="rename contacts"))
+    r.apply(ReasonerMessage(kind="progress", task_id="t1", update="5 renamed so far"))
+    # t1 is running; no done/confirm_required/failed message
+    ok, err = validate_act(
+        SpeechAct(act="relay", text="Renaming your contacts now", cites="t1"),
+        r,
+    )
+    assert not ok
+    assert "fact recorded yet" in err or "no fact" in err
