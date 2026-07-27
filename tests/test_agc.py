@@ -227,6 +227,49 @@ async def test_gain_estimate_adapts_across_a_sequence_rather_than_per_chunk(tmp_
         voice.close()
 
 
+# --- short utterances must reach target FAST, not just eventually ------------------
+
+@pytest.mark.asyncio
+async def test_short_quiet_utterance_reaches_target_band_before_it_ends(tmp_path):
+    """Regression for a real "Yes." (2.75s, peak 0.29, rms 0.0174) that the
+    upstream turn-taking model silently dropped even though AGC's *final*-chunk
+    gain (2.83x) looked fine in isolation. The real bug: the level EMA starts
+    neutral and ramps slowly, so the audio actually sent upstream for a short
+    utterance averages out far below the model's usable band before the gain
+    catches up (measured overall output rms ~0.024 on the real clip). Gain
+    sweeps against the real model showed OK only for overall output rms in
+    ~0.035-0.052; below that (or clipped, at gain 4x) it was dropped.
+
+    Shape this like the real clip: silence, then a short (<1s) burst of
+    rms ~0.017 speech, then silence again."""
+    voice, fake = make_voice(tmp_path, agc=True, agc_target_rms=0.05)
+    try:
+        silence = np.zeros(CHUNK_SAMPLES, dtype=np.float32)
+        speech_level = 0.017
+        burst = [make_chunk(speech_level, seed=800 + i) for i in range(5)]  # 5*160ms = 800ms
+
+        await feed_many(voice, [silence, silence])
+        n_before = len(fake.fed)
+        await feed_many(voice, burst)
+        speech_sent = fake.fed[n_before:]
+        await feed_many(voice, [silence, silence])
+
+        overall_rms = rms(np.concatenate(speech_sent))
+        assert 0.035 <= overall_rms <= 0.052, overall_rms
+        for out in speech_sent:
+            assert np.max(np.abs(out)) <= 1.0 + 1e-6
+
+        # The property that matters most must survive the faster attack:
+        # silence around the burst must still be untouched, not smeared by
+        # the estimate that was just snapped for the speech.
+        for original, sent in zip([silence, silence], fake.fed[:2]):
+            np.testing.assert_allclose(sent, original, atol=1e-7)
+        for original, sent in zip([silence, silence], fake.fed[-2:]):
+            np.testing.assert_allclose(sent, original, atol=1e-7)
+    finally:
+        voice.close()
+
+
 # --- what it did is visible ---------------------------------------------------------
 
 @pytest.mark.asyncio

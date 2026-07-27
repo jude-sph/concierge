@@ -48,6 +48,16 @@ class AutoGainControl:
       per-chunk and independent of the running estimate on purpose: a
       silent chunk arriving right after loud speech must not be boosted by
       a stale high estimate.
+    - The first speech-like chunk after a silent gap snaps the running
+      estimate straight to that chunk's own level instead of easing into it
+      from whatever the estimate was before the gap (fast attack; ordinary
+      EMA smoothing resumes on the chunks after that, i.e. slower release).
+      Without this, a short utterance -- a one-word confirmation being the
+      exact case that matters -- can end before a slow EMA ramp from a
+      neutral start ever reaches a useful gain: measured on real hardware,
+      a "Yes." whose *final*-chunk gain looked fine (2.83x) was still
+      silently dropped, because the OVERALL audio actually sent upstream
+      averaged out at only ~1.36x effective gain.
     - The gain is clamped to [1.0, max_gain]: it only ever boosts (audio
       that is already at or above target is left alone rather than
       attenuated -- levels that already worked upstream must not be
@@ -73,6 +83,10 @@ class AutoGainControl:
         self.level = target_rms  # neutral start: gain 1.0 until speech is seen
         self.last_gain = 1.0
         self.last_input_rms = 0.0
+        # Set on every silent chunk, cleared on the next speech-like one.
+        # Marks that the running estimate is stale from before a gap, so the
+        # next real speech should snap the estimate rather than ease into it.
+        self._after_silence = False
 
     def apply(self, chunk: np.ndarray) -> np.ndarray:
         chunk = np.asarray(chunk, dtype=np.float32)
@@ -84,9 +98,20 @@ class AutoGainControl:
             # this chunk perturb the running level estimate -- a burst of
             # silence must not average itself into "recent speech level".
             self.last_gain = 1.0
+            self._after_silence = True
             return chunk
 
-        self.level = self.smoothing * self.level + (1 - self.smoothing) * input_rms
+        if self._after_silence:
+            # First speech-like chunk after a gap: snap straight to its
+            # measured level instead of easing in from the stale estimate.
+            # A short utterance (e.g. a one-word confirmation) can be over
+            # before a slow EMA ramp ever gets there -- fast attack here,
+            # ordinary smoothing (slower release) below once speech is
+            # already established.
+            self.level = input_rms
+            self._after_silence = False
+        else:
+            self.level = self.smoothing * self.level + (1 - self.smoothing) * input_rms
 
         raw_gain = self.target_rms / max(self.level, self.floor_rms)
         gain = min(max(raw_gain, 1.0), self.max_gain)
