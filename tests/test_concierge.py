@@ -1,4 +1,8 @@
-from rtvoice.concierge import SpeechAct, validate_act
+import json
+
+import pytest
+
+from rtvoice.concierge import Concierge, SpeechAct, validate_act
 from rtvoice.protocol import ReasonerMessage
 from rtvoice.registry import TaskRegistry
 
@@ -112,3 +116,72 @@ def test_relay_citing_running_task_requires_fact():
     )
     assert not ok
     assert "fact recorded yet" in err or "no fact" in err
+
+
+# --- Concierge._complete / respond: the unparseable-reply fallback ----------
+#
+# Empirically, against a real 7B model, six consecutive `user_turn` calls all
+# returned bare text ("On it.", "Sure, what else?") instead of the required
+# JSON envelope -- every one failed json.loads and the turn was lost to a
+# JSONDecodeError. These tests fake the HTTP layer to reproduce that body
+# verbatim and check the defensive fallback in concierge.py, not just the
+# prompt wording (a prompt rule is not a guarantee).
+
+
+class _FakeResponse:
+    def __init__(self, content: str) -> None:
+        self._content = content
+
+    def raise_for_status(self) -> None:
+        pass
+
+    def json(self) -> dict:
+        return {"choices": [{"message": {"content": self._content}}]}
+
+
+def _concierge_replying(content: str) -> Concierge:
+    """A Concierge whose HTTP POST always returns `content` verbatim as the
+    model's raw completion body -- the only thing faked, same technique used
+    for LlmReasoner in test_llm_reasoner.py."""
+    c = Concierge()
+
+    async def fake_post(url, **kw):
+        return _FakeResponse(content)
+
+    c._client.post = fake_post
+    return c
+
+
+@pytest.mark.asyncio
+async def test_bare_text_reply_becomes_a_safe_spoken_act_not_a_crash():
+    """The live-session failure this fix targets: a bare sentence instead of
+    the JSON envelope must not raise JSONDecodeError out of respond() and
+    lose the turn -- it must surface as a safe spoken act, and it must be
+    counted as a violation so the regression is visible in the metrics."""
+    c = _concierge_replying("On it.")
+    act = await c.respond(TaskRegistry(), [], trigger="user_turn")
+    assert act.act in ("chat", "acknowledge")
+    assert act.text == "On it."
+    assert c.violations == 1
+
+
+@pytest.mark.asyncio
+async def test_bare_text_reply_can_never_become_a_relay():
+    """An unparsed reply carries no citation and no verified verbatim span,
+    so it must never be used to state a task fact -- even when the bare text
+    happens to look exactly like a citation and its verbatim span."""
+    act = await _concierge_replying("t1: renamed 47 contacts").respond(
+        registry_with_done_task(), [], trigger="reasoner_update"
+    )
+    assert act.act != "relay"
+
+
+@pytest.mark.asyncio
+async def test_malformed_json_is_not_swallowed_as_if_it_were_prose():
+    """Truncated/garbled JSON (still containing brace punctuation) is a
+    different failure from bare spoken text and must not be salvaged -- only
+    genuine bare-text replies are. Re-prompting repeats the same malformed
+    body here, so the error still propagates out of respond()."""
+    c = _concierge_replying('{"act": "chat", "text": "On it.')
+    with pytest.raises(json.JSONDecodeError):
+        await c.respond(TaskRegistry(), [], trigger="user_turn")

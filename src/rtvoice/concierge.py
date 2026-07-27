@@ -33,13 +33,44 @@ RULES:
 - Trigger "reasoner_update": speak only if there's something worth relaying,
   asking, or aborting - otherwise reply with empty text.
 
-Reply with a single JSON object and nothing else:
+OUTPUT FORMAT - read carefully:
+Your ENTIRE reply must be ONE JSON object and nothing else: no prose before
+or after it, no markdown code fences, no bare sentence on its own. The words
+you'd speak go ONLY inside that object's "text" field - they are a field
+VALUE, never your reply by itself.
+
+WRONG (a bare sentence - this is not JSON, it will be rejected):
+  On it.
+
+RIGHT (the same words, as the "text" field of a JSON object):
   {"act": "acknowledge", "text": "On it."}
+
+More valid envelopes - again, the quoted words are field values inside the
+object, never output on their own:
   {"act": "relay", "cites": "t1", "text": "Found it - renamed 47 contacts."}
   {"act": "ask", "text": "Which one did you mean?"}
   {"act": "abort", "cites": "t1"}
   {"act": "chat", "text": "Sure, what else?"}
 """
+
+# A model that ignores the envelope instruction and emits the bare spoken
+# sentence instead of the JSON object wrapping it (empirically: raw='On it.'
+# against a real 7B model, on every call of a six-call run). A prompt rule is
+# not a guarantee, so this is a second, structural line of defence: if the
+# body fails to parse as JSON at all, but looks like ordinary short spoken
+# prose rather than a mangled/truncated JSON attempt, salvage it as a safe
+# act instead of losing the whole turn to a JSONDecodeError. Anything that
+# still contains brace/bracket punctuation is presumed to be broken JSON, not
+# prose, and is left to raise - only true bare-text replies are salvaged.
+_BARE_REPLY_MAX_CHARS = 200
+
+
+def _looks_like_bare_reply(text: str) -> bool:
+    text = text.strip()
+    if not text or len(text) > _BARE_REPLY_MAX_CHARS:
+        return False
+    return "{" not in text and "[" not in text
+
 
 # A reply that is nothing but an unfilled template slot - the model copying
 # "..." (or a bracketed placeholder) straight out of the format spec above
@@ -96,9 +127,11 @@ class Concierge:
 
     Attributes:
         violations: Count of invalid speech act generations (not turns). Incremented
-            each time a model generation fails schema validation. A single turn can
-            contribute up to 2 to this counter (initial attempt + one re-prompt before
-            fallback). Use this metric to track generation quality, not turn success rate.
+            each time a model generation fails schema validation, or arrives as a bare,
+            unparseable-as-JSON reply salvaged into a safe act (see `_complete`). A
+            single turn can contribute up to 2 to this counter (initial attempt plus
+            one re-prompt before fallback). Use this metric to track generation
+            quality, not turn success rate.
     """
     def __init__(
         self,
@@ -111,7 +144,11 @@ class Concierge:
         self._client = httpx.AsyncClient(timeout=timeout)
         self.violations = 0  # invalid generations, not turns
 
-    async def _complete(self, messages: list[dict]) -> SpeechAct:
+    async def _complete(self, messages: list[dict]) -> tuple[SpeechAct, bool]:
+        """Returns (act, salvaged). `salvaged` is True when the body wasn't
+        valid JSON at all but looked like ordinary short spoken prose, so it
+        was wrapped into a safe chat act rather than raising - the caller
+        still must count that as an invalid generation."""
         resp = await self._client.post(
             f"{self.base_url}/chat/completions",
             json={
@@ -129,7 +166,17 @@ class Concierge:
         )
         resp.raise_for_status()
         content = resp.json()["choices"][0]["message"]["content"]
-        return SpeechAct(**json.loads(content))
+        try:
+            return SpeechAct(**json.loads(content)), False
+        except json.JSONDecodeError:
+            if not _looks_like_bare_reply(content):
+                raise
+            # Salvage, never relay: a bare reply carries no citation and no
+            # verified verbatim span, so the only thing it can ever become is
+            # a safe, non-factual act. act="chat" is hardcoded here - never
+            # derived from the model's text - so this path can never produce
+            # a "relay".
+            return SpeechAct(act="chat", text=content.strip()), True
 
     async def respond(
         self, registry: TaskRegistry, history: list[dict], trigger: str
@@ -143,16 +190,20 @@ class Concierge:
             {"role": "user", "content": f"[trigger: {trigger}]"},
         ]
 
-        act = await self._complete(messages)
+        act, salvaged = await self._complete(messages)
         ok, err = validate_act(act, registry)
         if ok:
+            if salvaged:
+                self.violations += 1
             return act
 
         self.violations += 1
         messages.append({"role": "system", "content": f"Rejected: {err}. Try again."})
-        act = await self._complete(messages)
+        act, salvaged = await self._complete(messages)
         ok, _ = validate_act(act, registry)
         if ok:
+            if salvaged:
+                self.violations += 1
             return act
 
         self.violations += 1
