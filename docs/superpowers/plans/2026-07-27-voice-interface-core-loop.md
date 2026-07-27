@@ -2231,7 +2231,6 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'rtvoice.recorder'`
 - [ ] **Step 3: Implement the recorder**
 
 ```python
-# src/rtvoice/recorder.py
 """Dual-channel session recorder.
 
 Channels are kept separate as well as mixed so user and model audio can be
@@ -2252,22 +2251,75 @@ class SessionRecorder:
     def __init__(self, session_dir: str | Path) -> None:
         self.dir = Path(session_dir)
         self.dir.mkdir(parents=True, exist_ok=True)
-        self._user: list[np.ndarray] = []
-        self._model: list[np.ndarray] = []
+        self._user_file = sf.SoundFile(
+            self.dir / "user.wav", "w", samplerate=SAMPLE_RATE, channels=1, subtype="FLOAT"
+        )
+        self._model_file = sf.SoundFile(
+            self.dir / "model.wav", "w", samplerate=SAMPLE_RATE, channels=1, subtype="FLOAT"
+        )
+        self._closed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
+
+    def __del__(self):
+        """Defensive cleanup: close file handles if close() was not called.
+
+        Runs during garbage collection and is defensive against:
+        - Partially initialized objects
+        - Interpreter shutdown
+        - Exceptions during initialization
+        """
+        try:
+            # Guard against partially-initialized instances
+            if not hasattr(self, "_closed") or not hasattr(self, "_user_file"):
+                return
+            if not self._closed and self._user_file is not None:
+                try:
+                    self._user_file.close()
+                except Exception:
+                    pass
+            if not hasattr(self, "_model_file"):
+                return
+            if not self._closed and self._model_file is not None:
+                try:
+                    self._model_file.close()
+                except Exception:
+                    pass
+        except Exception:
+            # Swallow all exceptions during cleanup
+            pass
 
     def write_user(self, chunk: np.ndarray) -> None:
-        self._user.append(np.asarray(chunk, dtype=np.float32).copy())
+        if not self._closed:
+            self._user_file.write(np.asarray(chunk, dtype=np.float32))
 
     def write_model(self, chunk: np.ndarray) -> None:
-        self._model.append(np.asarray(chunk, dtype=np.float32).copy())
+        if not self._closed:
+            self._model_file.write(np.asarray(chunk, dtype=np.float32))
 
     def close(self) -> None:
-        user = np.concatenate(self._user) if self._user else np.zeros(0, dtype=np.float32)
-        model = np.concatenate(self._model) if self._model else np.zeros(0, dtype=np.float32)
+        if self._closed:
+            return
+        self._closed = True
+        self._user_file.close()
+        self._model_file.close()
 
-        sf.write(self.dir / "user.wav", user, SAMPLE_RATE)
-        sf.write(self.dir / "model.wav", model, SAMPLE_RATE)
+        # Read back the written files to construct the mix
+        user, _ = sf.read(self.dir / "user.wav", dtype="float32")
+        model, _ = sf.read(self.dir / "model.wav", dtype="float32")
 
+        # Handle scalar case (single sample becomes 0-d array)
+        if user.ndim == 0:
+            user = np.array([user], dtype=np.float32)
+        if model.ndim == 0:
+            model = np.array([model], dtype=np.float32)
+
+        # Create stereo mix with zero-padding for unequal lengths
         n = max(len(user), len(model))
         mix = np.zeros((n, 2), dtype=np.float32)
         mix[: len(user), 0] = user
@@ -2283,7 +2335,6 @@ Expected: PASS (4 passed)
 - [ ] **Step 5: Implement the TTS wrapper**
 
 ```python
-# src/rtvoice/tts.py
 """Kokoro TTS, streamed and interruptible.
 
 Kokoro emits 24 kHz; everything else in this system is 16 kHz, so we resample
@@ -2314,15 +2365,15 @@ class KokoroTTS:
 
         self._pipeline = KPipeline(lang_code=lang_code)
         self.voice = voice
-        self._stopped = False
+        self._generation = 0
 
     def stop(self) -> None:
-        self._stopped = True
+        self._generation += 1
 
     async def stream(self, text: str) -> AsyncIterator[np.ndarray]:
-        self._stopped = False
+        generation = self._generation
         for _, _, audio in self._pipeline(text, voice=self.voice):
-            if self._stopped:
+            if generation != self._generation:
                 return
             yield _resample(np.asarray(audio, dtype=np.float32), KOKORO_RATE, SAMPLE_RATE)
 ```
