@@ -45,7 +45,8 @@ speech by construction, and a fraction of the footprint.
 
 - **On-device / phone deployment.** Explicitly out of scope. Component boundaries are drawn
   so the phone story stays open, but no footprint optimisation happens now.
-- Diffusion-rendered UI, click interpretation, or any non-voice input.
+- Diffusion-rendered UI, click interpretation, or any non-voice input *as a product surface*.
+  (The UI's manual text injection is a development affordance, not an input modality.)
 - Production hardening, multi-user, authentication.
 - Beating any benchmark. This is an architecture probe.
 
@@ -54,31 +55,34 @@ speech by construction, and a fraction of the footprint.
 Five services across three processes.
 
 ```
-┌─ Mac ──────────────┐         ┌─ 3090 (via SSH tunnel) ─────────────────┐
-│                    │         │                                          │
-│  audio-client      │◄──WS───►│  ┌────────────────────────────────────┐ │
-│  · mic capture     │  PCM    │  │ voice-service                      │ │
-│  · speaker out     │  16kHz  │  │  · SenseVoice Small (STT)          │ │
-│  · session logging │         │  │  · SoulX-Duplug (state @ 160ms)    │ │
-└────────────────────┘         │  │  · Kokoro (TTS)                    │ │
-                               │  └──────────┬─────────────────────────┘ │
-                               │             │ (state, transcript)        │
-                               │             ▼                            │
-                               │  ┌────────────────────────────────────┐ │
-                               │  │ orchestrator      ← the real build │ │
-                               │  │  · turn policy                     │ │
-                               │  │  · task registry (source of truth) │ │
-                               │  │  · cancellation tokens             │ │
-                               │  │  · concierge (3–8B)                │ │
-                               │  └──────────┬─────────────────────────┘ │
-                               │             │ protocol messages          │
-                               │             ▼                            │
-                               │  ┌────────────────────────────────────┐ │
-                               │  │ reasoner-stub                      │ │
-                               │  │  · 8–14B roleplaying memory agent  │ │
-                               │  │  · journaled device_state.json     │ │
-                               │  └────────────────────────────────────┘ │
-                               └──────────────────────────────────────────┘
+┌─ Mac: browser ───────────┐   ┌─ 3090 (via SSH tunnel) ──────────────────┐
+│                          │   │                                           │
+│  audio I/O               │◄WS┼─►┌─────────────────────────────────────┐ │
+│   · mic capture          │PCM│  │ voice-service                       │ │
+│   · playback (headphones)│16k│  │  · SenseVoice Small (STT)           │ │
+│                          │   │  │  · SoulX-Duplug (state @ 160ms)     │ │
+│  instrument UI           │   │  │  · Kokoro (TTS)                     │ │
+│   · state timeline       │   │  │  · dual-channel recorder            │ │
+│   · transcripts          │   │  └───────────────┬─────────────────────┘ │
+│   · task registry        │   │                  │ (state, transcript)    │
+│   · device state + diffs │   │                  ▼                        │
+│   · replay controls      │◄WS┼──┌─────────────────────────────────────┐ │
+│                          │evt│  │ orchestrator       ← the real build  │ │
+└──────────────────────────┘   │  │  · turn policy                      │ │
+                               │  │  · task registry (source of truth)  │ │
+                               │  │  · cancellation tokens              │ │
+                               │  │  · concierge (3–8B)                 │ │
+                               │  │  · event log (JSONL)                │ │
+                               │  │  · static UI + event WS             │ │
+                               │  └───────────────┬─────────────────────┘ │
+                               │                  │ protocol messages      │
+                               │                  ▼                        │
+                               │  ┌─────────────────────────────────────┐ │
+                               │  │ reasoner-stub                       │ │
+                               │  │  · 8–14B roleplaying memory agent   │ │
+                               │  │  · journaled device_state.json      │ │
+                               │  └─────────────────────────────────────┘ │
+                               └───────────────────────────────────────────┘
 ```
 
 ### Deployment rationale
@@ -125,9 +129,9 @@ that decides whether the split is ever needed.
 
 | Component | Responsibility | Notes |
 |---|---|---|
-| **audio-client** | Mic in, speaker out, session recording. Nothing else. | Deliberately dumb so it never changes |
-| **voice-service** | Owns all audio. Emits `(state, transcript_delta)` every 160 ms; accepts `speak()` / `stop()` | The relocatable boundary |
-| **orchestrator** | Turn policy, task registry, cancellation, concierge | Everything novel lives here |
+| **browser client** | Mic capture, audio playback, instrument UI, replay | Two sockets: audio to voice-service, events to orchestrator |
+| **voice-service** | Owns all audio. Emits `(state, transcript_delta)` every 160 ms; accepts `speak()` / `stop()`; records both channels | The relocatable boundary |
+| **orchestrator** | Turn policy, task registry, cancellation, concierge, event log, UI hosting | Everything novel lives here |
 | **reasoner-stub** | Roleplays the memory agent against journaled `device_state.json` | Swapped for the real reasoner via the same protocol |
 
 `device_state.json` holds contacts, messages, calendar entries and places. The stub genuinely
@@ -326,9 +330,11 @@ sequences as fixtures. Covers turn policy, task registry transitions, barge-in, 
 rollback, schema validation, timeouts. Most of the build's logic lives here and runs in
 milliseconds.
 
-**Layer 2 — voice-service replay.** Record real audio sessions once; replay through the real
-voice-service. Same audio in → same `(state, transcript)` sequence out. Regression-tests
-turn-taking without speaking into a mic.
+**Layer 2 — voice-service replay.** Replay recorded sessions (`user.wav` from any session
+directory) through the real voice-service. Same audio in → same `(state, transcript)`
+sequence out, asserted against that session's `events.jsonl`. Regression-tests turn-taking
+without speaking into a mic. Since recording is always on, the corpus accumulates for free
+as the system gets used.
 
 **Layer 3 — end-to-end.** Assertions on `device_state.json`. "Set all contacts to Hans" →
 diff the file. Writes are verifiable, not vibes.
@@ -349,6 +355,94 @@ Logged every session:
 - Dispatch-to-first-audio latency, mean **and** tail
 - Tunnel RTT and jitter
 - Turn-taking false-positive / false-negative counts
+
+## Web UI and observability
+
+The browser replaces a separate audio client: it captures mic and plays audio via WebAudio
+over the same tunnel, and hosts the instrument panel. Note this is **not** the WebRTC option
+rejected earlier — raw PCM over a WebSocket needs no STUN/TURN/UDP, so the university
+firewall is irrelevant.
+
+Two sockets preserve the existing boundary: browser → voice-service (binary audio),
+browser → orchestrator (JSON events). If voice-service later moves to the Mac, the browser
+points at localhost and the escape hatch gets *simpler*, not harder.
+
+**Acoustic echo must be handled from day one.** If the mic hears the TTS, SoulX-Duplug emits
+`user_nonidle` and the system barges in on itself continuously. Use
+`getUserMedia({echoCancellation: true})` and headphones for demos. Gating the mic while
+speaking would also fix it but destroys barge-in, so it is not an option.
+
+### Everything renders from one event stream
+
+The orchestrator emits an append-only JSONL event log — every state token, protocol message,
+task transition, device write and metric. The UI is a pure function of that stream.
+
+This is the design point that pays for itself: live view is a subscription; session replay
+feeds a recorded log to the same UI with no separate code path; Layer 2 tests assert on the
+same log; and demos become reproducible, since a good run can be replayed if the live one
+misbehaves. The event log is a first-class artifact, not a debug afterthought.
+
+All timestamps are monotonic offsets from a recorded session start, so audio and events
+align frame-accurately on replay.
+
+### Panels
+
+| Panel | Shows | Why |
+|---|---|---|
+| **State timeline** | Scrolling colour-coded strip of the 160 ms state stream | The money shot — watch it hold through a hesitation on `user_incomplete` instead of barging in. Makes the invisible thing the architecture rests on visible |
+| **Transcript** | Both sides, state annotations inline, per-turn timing | |
+| **Task registry** | Live cards: id, `understood_as`, status, elapsed | Three cards from one utterance is how compound dispatch demonstrates itself |
+| **Reasoner terminal** | Streamed reasoning tokens + operations log, phone-terminal styled | `> UPDATE contacts SET first_name='Hans'  47 rows ✓ committed` |
+| **Device state** | Live `device_state.json` with changed fields highlighted on write | The terminal shows the operation; this shows the consequence |
+| **Concierge acts** | Raw speech acts as JSON (`act`, `cites`, `text`) + violation counter | Makes the citation discipline visible rather than theoretical |
+| **Instruments** | Per-turn latency waterfall (turn-detect / concierge / TTS / network), citation-violation rate, turn-taking FP/FN, tunnel RTT and jitter | Shows *where* the ~450 ms went |
+
+### Development affordances
+
+- **Manual text injection** — type as if spoken, bypassing audio. Needed constantly during
+  development and makes the orchestrator exercisable without a mic.
+- **Reasoner latency slider** — artificially slow the stub to 5 s / 30 s. The stub's latency
+  is chosen rather than discovered, so this is how long-wait behaviour gets tested on demand,
+  and how the "does the concierge earn its keep" question gets answered.
+
+### Session recording
+
+**Recording is always on.** Storage is trivial (16 kHz mono WAV is ~32 kB/s; a ten-minute
+session is ~20 MB for both channels), and always-on means a good accidental take is never
+lost. Sessions are curated after the fact with a "mark" button and a session browser, rather
+than by remembering to press record beforehand.
+
+Each session produces a self-contained directory:
+
+```
+sessions/2026-07-27T14-32-05/
+  events.jsonl        # complete event log — the replayable artifact
+  user.wav            # mic input, 16 kHz mono
+  model.wav           # TTS output, 16 kHz mono
+  mix.wav             # stereo: user left, model right
+  device_state.json   # final state
+  device_journal.jsonl# every write, for diffing and rollback
+  meta.json           # duration, marks, config, model versions
+  screen.webm         # optional, if screen capture was used
+```
+
+**Audio is recorded server-side in voice-service**, not in the browser — it already holds
+both PCM streams, avoids `MediaRecorder` frame loss, and is already aligned to the event
+clock. Channels are kept **separate** as well as mixed, so user and model audio can be
+analysed independently (and so echo can be diagnosed rather than guessed at).
+
+**Video is an export, not the recording.** The event log plus audio *is* the session and
+replays perfectly in the UI. `getDisplayMedia` screen capture is a one-click convenience for
+when an actual video file needs to leave the machine.
+
+One **Export** button bundles the session directory as a zip.
+
+### Explicitly out of scope for the UI
+
+No auth, no multi-session, no persistence beyond the session directories, no responsive or
+mobile layout. Single user, desktop, local — an instrument panel, not a product. Plain
+HTML/JS with **no build step**, served by the orchestrator's existing FastAPI process; adding
+a bundler to a demo UI costs a day and returns nothing.
 
 ## Open questions
 
