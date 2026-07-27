@@ -18,8 +18,28 @@ from fastapi import FastAPI
 from .cancellation import CancellationToken
 from .device import DeviceState
 from .protocol import OrchestratorMessage, ReasonerMessage
+from .states import (
+    AFFIRMATIVE_PHRASES,
+    AFFIRMATIVE_WORDS,
+    NEGATION_PHRASES,
+    NEGATION_WORDS,
+    is_answer_shaped,
+)
 
 _ids = itertools.count(1)
+
+
+def _vocab_re(words: set[str], phrases: set[str]) -> re.Pattern:
+    """Word-boundary alternation over a vocabulary, longest phrase first."""
+    parts = sorted(phrases, key=len, reverse=True) + sorted(words)
+    return re.compile(r"\b(?:" + "|".join(re.escape(p) for p in parts) + r")\b", re.I)
+
+
+# Both vocabularies come from states.py, which also owns the backchannel set,
+# so the words the turn policy promotes to answers and the words the reasoner
+# accepts as answers cannot drift apart again.
+_NEGATION_RE = _vocab_re(NEGATION_WORDS, NEGATION_PHRASES)
+_AFFIRMATIVE_RE = _vocab_re(AFFIRMATIVE_WORDS, AFFIRMATIVE_PHRASES)
 
 # Splitting on " and " is enough for the compound commands we demo; the real
 # reasoner does this properly.
@@ -98,19 +118,36 @@ class ReasonerStub:
         return []
 
     async def _confirm(self, task_id: str | None, answer: str) -> list[ReasonerMessage]:
-        plan = self._pending.pop(task_id or "", None)
+        key = task_id or ""
+        plan = self._pending.get(key)
         if plan is None:
             return [ReasonerMessage(kind="noop")]
 
-        # Default-deny: check for negations first, regardless of any affirmative words present
-        if re.search(r"\b(no|nope|don't|dont|do not|not|never mind|nevermind|cancel|stop|wait|hold on|forget it)\b", answer, re.I):
+        # Gate 1 -- is this an ANSWER at all? Only an utterance that is
+        # essentially just a yes/no may resolve a pending destructive write.
+        # A sentence carrying its own new request is not an answer no matter
+        # what words it happens to contain, and must leave the question open
+        # rather than being read as either assent or a decline. (Before this
+        # gate, "okay so what's on my calendar tomorrow" renamed every
+        # contact on the device.) Leaving `_pending` untouched is the point:
+        # the task stays AWAITING_CONFIRM and remains answerable.
+        if not is_answer_shaped(answer):
+            return [ReasonerMessage(kind="noop")]
+
+        self._pending.pop(key, None)
+
+        # Gate 2 -- default-deny: negations are checked first, regardless of
+        # any affirmative words also present ("don't do it", "that is not
+        # okay", "no, don't confirm it").
+        if _NEGATION_RE.search(answer):
             self.device.rollback()
             self._tokens.pop(task_id, None)
             self.tokens.pop(task_id, None)
             return [ReasonerMessage(kind="failed", task_id=task_id, reason="cancelled by user")]
 
-        # Only commit if affirmative word is present
-        if not re.search(r"\b(yes|yeah|yep|do it|go ahead|confirm|ok|okay)\b", answer, re.I):
+        # Gate 3 -- only an explicit affirmative commits. Anything ambiguous
+        # ("hmm") declines.
+        if not _AFFIRMATIVE_RE.search(answer):
             self.device.rollback()
             self._tokens.pop(task_id, None)
             self.tokens.pop(task_id, None)

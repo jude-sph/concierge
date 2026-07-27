@@ -61,3 +61,13 @@ def test_complete_while_speaking_stops_first():
 
 def test_idle_does_nothing():
     assert decide(ev(UserState.IDLE), PolicyState()) == []
+
+
+def test_empty_backchannel_is_never_an_answer_to_a_pending_question():
+    """IMPORTANT 5: an empty `speak` frame classifies as a backchannel ("" is
+    in the backchannel vocabulary). Promoting it to a real answer sends an
+    empty clarification_answer to the reasoner, which default-denies -- so a
+    pending destructive task is cancelled with the user having said nothing."""
+    state = PolicyState(pending_question="This will rename 47 contacts. Confirm?")
+    assert decide(ev(UserState.BACKCHANNEL, ""), state) == []
+    assert decide(ev(UserState.BACKCHANNEL, "   "), state) == []

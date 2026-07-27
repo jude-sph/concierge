@@ -48,8 +48,17 @@ def decide(event: TurnEvent, state: PolicyState) -> list[Action]:
     # A bare "yes"/"ok" reads as a backchannel by wording, but it is a real
     # answer when we are holding a question. Disambiguate here, in the layer
     # that has the dialogue context - the adapter deliberately does not.
+    #
+    # An EMPTY transcript is the exception that proves the rule: "" is in the
+    # backchannel vocabulary, so a `speak` frame with no text arrives here as
+    # a BACKCHANNEL. Promoting silence to an answer sent an empty
+    # clarification_answer to the reasoner, which default-denied it and
+    # cancelled a pending destructive task the user had said nothing about.
+    # Silence is never an answer.
     answers_question = (
-        event.state is UserState.BACKCHANNEL and state.pending_question is not None
+        event.state is UserState.BACKCHANNEL
+        and state.pending_question is not None
+        and bool(event.transcript.strip())
     )
     if event.state is UserState.BACKCHANNEL and not answers_question:
         # "mm hm" mid-utterance is not a turn grab. Keep speaking.
