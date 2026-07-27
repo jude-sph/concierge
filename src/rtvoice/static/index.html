@@ -1,0 +1,524 @@
+<title>rtvoice — live demo panel</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0b0d10;
+    --panel: #14171c;
+    --panel-border: #2a2f38;
+    --fg: #e8ecf1;
+    --fg-dim: #8b93a1;
+    --accent: #4fd1c5;
+    --user: #6ab0ff;
+    --assistant: #4fd1c5;
+    --warn: #f5a623;
+    --bad: #ff5c5c;
+    --good: #4caf50;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--bg); color: var(--fg);
+    font-family: "SF Mono", Menlo, Consolas, "Courier New", monospace;
+    font-size: 15px;
+  }
+  body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+
+  header {
+    display: flex; align-items: center; gap: 20px;
+    padding: 10px 16px; background: #10131a; border-bottom: 1px solid var(--panel-border);
+    flex: 0 0 auto;
+  }
+  header h1 { font-size: 16px; margin: 0; color: var(--fg-dim); font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; }
+
+  #btn-start-stop {
+    font-size: 20px; font-weight: 700; padding: 12px 34px; border-radius: 10px;
+    border: 2px solid var(--accent); background: transparent; color: var(--accent);
+    cursor: pointer; letter-spacing: 0.05em;
+  }
+  #btn-start-stop.running { background: var(--bad); border-color: var(--bad); color: #1a0000; }
+
+  .status-chip { padding: 4px 10px; border-radius: 999px; border: 1px solid var(--panel-border); font-size: 13px; color: var(--fg-dim); }
+  .status-chip.on { color: var(--good); border-color: var(--good); }
+  .status-chip.speaking { color: var(--warn); border-color: var(--warn); }
+  .status-chip.bad { color: var(--bad); border-color: var(--bad); }
+
+  #mic-error { color: var(--bad); font-size: 13px; }
+
+  main {
+    flex: 1 1 auto; display: grid; min-height: 0;
+    grid-template-columns: 1.1fr 1fr 0.9fr 1.1fr;
+    gap: 1px; background: var(--panel-border);
+  }
+  .panel { background: var(--panel); display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+  .panel h2 {
+    margin: 0; padding: 8px 12px; font-size: 12px; text-transform: uppercase;
+    letter-spacing: 0.08em; color: var(--fg-dim); border-bottom: 1px solid var(--panel-border);
+    flex: 0 0 auto;
+  }
+  .panel-body { flex: 1 1 auto; overflow-y: auto; padding: 8px 12px; min-height: 0; }
+  .panel-body.mono { white-space: pre-wrap; word-break: break-word; font-size: 12.5px; line-height: 1.5; color: var(--fg-dim); }
+
+  .msg-user, .msg-assistant { margin-bottom: 10px; line-height: 1.4; }
+  .msg-user b { color: var(--user); }
+  .msg-assistant b { color: var(--assistant); }
+  .silent-tag { color: var(--warn); font-size: 12px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--panel-border); vertical-align: top; }
+  th { color: var(--fg-dim); font-weight: 600; position: sticky; top: 0; background: var(--panel); }
+  .empty { color: var(--fg-dim); font-style: italic; padding: 6px 0; }
+
+  tr.status-done { color: var(--good); }
+  tr.status-failed, tr.status-cancelled { color: var(--bad); }
+  tr.status-running, tr.status-pending { color: var(--fg); }
+  tr.status-awaiting_confirm { color: var(--warn); }
+
+  @keyframes flash-row {
+    from { background: rgba(79, 209, 197, 0.35); }
+    to   { background: transparent; }
+  }
+  tr.flash { animation: flash-row 1.4s ease-out; }
+
+  .device-table { margin-bottom: 16px; }
+  .device-table h4 { margin: 0 0 4px; font-size: 12px; color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.06em; }
+
+  footer {
+    flex: 0 0 auto; display: flex; gap: 8px; padding: 10px 16px;
+    background: #10131a; border-top: 1px solid var(--panel-border);
+  }
+  #inject-text {
+    flex: 1; font-family: inherit; font-size: 15px; padding: 10px 12px;
+    background: #0b0d10; border: 1px solid var(--panel-border); border-radius: 6px; color: var(--fg);
+  }
+  #inject-form button {
+    font-family: inherit; font-size: 14px; padding: 10px 20px; border-radius: 6px;
+    border: 1px solid var(--accent); background: transparent; color: var(--accent); cursor: pointer;
+  }
+</style>
+
+<header>
+  <h1>rtvoice demo</h1>
+  <button id="btn-start-stop">Start</button>
+  <span id="chip-mic" class="status-chip">mic: off</span>
+  <span id="chip-audio" class="status-chip">audio: off</span>
+  <span id="chip-events" class="status-chip">events: connecting</span>
+  <span id="chip-speaking" class="status-chip">idle</span>
+  <span id="mic-error"></span>
+</header>
+
+<main>
+  <section class="panel">
+    <h2>Transcript</h2>
+    <div id="transcript-body" class="panel-body"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Tasks</h2>
+    <div id="tasks-body" class="panel-body"><div class="empty">(none yet)</div></div>
+  </section>
+
+  <section class="panel">
+    <h2>Device state</h2>
+    <div id="device-body" class="panel-body"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Event log</h2>
+    <div id="event-log-body" class="panel-body mono"></div>
+  </section>
+</main>
+
+<footer>
+  <form id="inject-form" style="display:flex; flex:1; gap:8px;">
+    <input id="inject-text" type="text" autocomplete="off"
+           placeholder="Type an utterance and press Enter (works even if mic/TTS is unavailable)" />
+    <button type="submit">Send</button>
+  </form>
+</footer>
+
+<script>
+"use strict";
+
+// --- small helpers -----------------------------------------------------------
+
+function escapeHtml(s) {
+  return String(s === undefined || s === null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function wsUrl(path) {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  return `${proto}://${location.host}${path}`;
+}
+
+function setChip(id, text, cls) {
+  const el = document.getElementById(id);
+  el.textContent = text;
+  el.className = "status-chip" + (cls ? " " + cls : "");
+}
+
+// --- event log ---------------------------------------------------------------
+
+const eventLines = [];
+
+function appendEventLog(msg) {
+  const line = `[${msg.t_ms}ms] ${msg.kind} ${JSON.stringify(msg.data)}`;
+  eventLines.push(line);
+  if (eventLines.length > 400) eventLines.shift();
+  const el = document.getElementById("event-log-body");
+  el.textContent = eventLines.join("\n");
+  el.scrollTop = el.scrollHeight;
+}
+
+// --- transcript ---------------------------------------------------------------
+//
+// Built from the SAME event stream the log panel shows, not re-derived audio:
+//   to_reasoner        -> what the user said (post silence-timeout / merge-window,
+//                          i.e. the text the reasoner actually acted on)
+//   concierge_act       -> what the assistant said, when the concierge is on
+//   from_reasoner       -> the assistant's reply when the concierge is OFF
+//                          (the v1 default): the reasoner's own verbatim text
+//                          is what gets spoken directly.
+//   tts_failed          -> TTS raised (e.g. kokoro not installed); the text
+//                          above is still correct, just mark it silent.
+//
+// concierge_act is treated as authoritative once it's been seen at all, so
+// flipping USE_CONCIERGE=1 doesn't produce two assistant lines per turn.
+
+const SPEAK_ON = new Set(["done", "failed", "need_clarification", "confirm_required"]);
+let conciergeSeen = false;
+const transcript = [];
+
+function pushTranscript(role, text) {
+  transcript.push({ role, text, silent: false });
+  if (transcript.length > 200) transcript.shift();
+}
+
+function markLastAssistantSilent(text) {
+  for (let i = transcript.length - 1; i >= 0; i--) {
+    if (transcript[i].role === "assistant" && transcript[i].text === text) {
+      transcript[i].silent = true;
+      return;
+    }
+  }
+}
+
+function handleTranscriptEvent(msg) {
+  const data = msg.data || {};
+  if (msg.kind === "to_reasoner" && data.text) {
+    pushTranscript("user", data.text);
+  } else if (msg.kind === "concierge_act") {
+    conciergeSeen = true;
+    if (data.text) pushTranscript("assistant", data.text);
+  } else if (msg.kind === "from_reasoner" && !conciergeSeen && SPEAK_ON.has(data.msg_kind)) {
+    const text = data.result || data.reason || data.verbatim_text || data.question;
+    if (text) pushTranscript("assistant", text);
+  } else if (msg.kind === "tts_failed" && data.text) {
+    markLastAssistantSilent(data.text);
+  } else {
+    return; // nothing to re-render
+  }
+  renderTranscript();
+}
+
+function renderTranscript() {
+  const el = document.getElementById("transcript-body");
+  el.innerHTML = transcript.map((t) => {
+    const label = t.role === "user" ? "You" : "Assistant";
+    const cls = t.role === "user" ? "msg-user" : "msg-assistant";
+    const suffix = t.silent ? ' <span class="silent-tag">(no audio — TTS unavailable)</span>' : "";
+    return `<div class="${cls}"><b>${label}:</b> ${escapeHtml(t.text)}${suffix}</div>`;
+  }).join("");
+  el.scrollTop = el.scrollHeight;
+}
+
+// --- events websocket ----------------------------------------------------------
+
+function connectEvents() {
+  setChip("chip-events", "events: connecting", "");
+  const ws = new WebSocket(wsUrl("/events"));
+  ws.onopen = () => setChip("chip-events", "events: live", "on");
+  ws.onmessage = (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch (e) { return; }
+    appendEventLog(msg);
+    handleTranscriptEvent(msg);
+  };
+  ws.onclose = () => {
+    setChip("chip-events", "events: reconnecting…", "bad");
+    setTimeout(connectEvents, 1000);
+  };
+  ws.onerror = () => ws.close();
+}
+
+// --- tasks + device state, via polling /state -----------------------------------
+//
+// Simplification made under time pressure: tasks are rendered from GET /state
+// (the same endpoint the device panel already needs to poll) rather than
+// re-derived independently from the event stream. It is still "live" -- just
+// on a ~500ms poll instead of push -- and is far less code to get right before
+// tonight than reconstructing task rows from from_reasoner events by hand.
+
+const lastTaskStatus = {};
+let firstStatePoll = true;
+
+function statusClass(status) {
+  return "status-" + String(status || "").toLowerCase();
+}
+
+function renderTasks(tasks) {
+  const el = document.getElementById("tasks-body");
+  if (!tasks.length) {
+    el.innerHTML = '<div class="empty">(none yet)</div>';
+    return;
+  }
+  const rows = tasks.map((t) => {
+    const changed = !firstStatePoll && lastTaskStatus[t.task_id] !== undefined
+      && lastTaskStatus[t.task_id] !== t.status;
+    lastTaskStatus[t.task_id] = t.status;
+    const cls = statusClass(t.status) + (changed ? " flash" : "");
+    return `<tr class="${cls}"><td>${escapeHtml(t.task_id)}</td>` +
+      `<td>${escapeHtml(t.understood_as)}</td>` +
+      `<td>${escapeHtml(t.status)}</td>` +
+      `<td>${escapeHtml(t.detail)}</td></tr>`;
+  }).join("");
+  el.innerHTML = `<table><thead><tr><th>id</th><th>understood as</th><th>status</th><th>detail</th></tr></thead>` +
+    `<tbody>${rows}</tbody></table>`;
+}
+
+let lastDeviceRows = {};
+
+function renderDevice(device) {
+  const el = document.getElementById("device-body");
+  const nextRows = {};
+  let html = "";
+  for (const [table, rows] of Object.entries(device)) {
+    nextRows[table] = {};
+    html += `<div class="device-table"><h4>${escapeHtml(table)}</h4>`;
+    if (!Array.isArray(rows) || rows.length === 0) {
+      html += `<div class="empty">(empty)</div></div>`;
+      continue;
+    }
+    const cols = [...new Set(rows.flatMap((r) => Object.keys(r)))];
+    const prevTable = lastDeviceRows[table] || {};
+    const bodyRows = rows.map((row) => {
+      const key = row.id !== undefined ? String(row.id) : JSON.stringify(row);
+      const json = JSON.stringify(row);
+      nextRows[table][key] = json;
+      const changed = !firstStatePoll && prevTable[key] !== undefined && prevTable[key] !== json;
+      const cls = changed ? "flash" : "";
+      const tds = cols.map((c) => `<td>${escapeHtml(row[c])}</td>`).join("");
+      return `<tr class="${cls}">${tds}</tr>`;
+    }).join("");
+    html += `<table><thead><tr>${cols.map((c) => `<th>${escapeHtml(c)}</th>`).join("")}</tr></thead>` +
+      `<tbody>${bodyRows}</tbody></table></div>`;
+  }
+  el.innerHTML = html;
+  lastDeviceRows = nextRows;
+}
+
+async function pollState() {
+  try {
+    const res = await fetch("/state");
+    if (!res.ok) return;
+    const data = await res.json();
+    renderTasks(data.tasks || []);
+    renderDevice(data.device || {});
+    if (data.speaking) {
+      setChip("chip-speaking", "speaking…", "speaking");
+    } else if (data.pending_question) {
+      setChip("chip-speaking", "awaiting: " + data.pending_question, "speaking");
+    } else {
+      setChip("chip-speaking", "idle", "");
+    }
+    firstStatePoll = false;
+  } catch (e) {
+    // server not reachable yet; try again on the next tick
+  }
+}
+
+// --- text fallback: POST /inject -----------------------------------------------
+
+async function onInjectSubmit(e) {
+  e.preventDefault();
+  const input = document.getElementById("inject-text");
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = "";
+  try {
+    await fetch("/inject", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+  } catch (err) {
+    console.error("inject failed", err);
+  }
+}
+
+// --- mic capture + playback, over /audio ----------------------------------------
+//
+// AudioContext is created with {sampleRate: 16000} so modern browsers run the
+// whole capture graph at 16 kHz already (getUserMedia's sampleRate constraint
+// alone is not reliable across browsers, but MediaStreamSourceNode always
+// resamples the track to the context's rate). The worklet just chunks
+// whatever it receives into fixed 2560-sample (160ms) frames.
+
+const WORKLET_SOURCE = `
+class PCMChunker extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this._buf = new Float32Array(0);
+    this._chunkSize = 2560;
+  }
+  process(inputs) {
+    const input = inputs[0];
+    if (input && input.length > 0) {
+      const channel = input[0];
+      if (channel && channel.length) {
+        const merged = new Float32Array(this._buf.length + channel.length);
+        merged.set(this._buf, 0);
+        merged.set(channel, this._buf.length);
+        this._buf = merged;
+        while (this._buf.length >= this._chunkSize) {
+          const chunk = this._buf.slice(0, this._chunkSize);
+          this._buf = this._buf.slice(this._chunkSize);
+          this.port.postMessage(chunk, [chunk.buffer]);
+        }
+      }
+    }
+    return true;
+  }
+}
+registerProcessor("pcm-chunker", PCMChunker);
+`;
+
+let running = false;
+let micStream = null;
+let audioCtx = null;
+let sourceNode = null;
+let captureNode = null;
+let silentGain = null;
+let audioWs = null;
+let nextPlaybackTime = 0;
+
+function playback(arrayBuffer) {
+  if (!audioCtx) return;
+  const floatData = new Float32Array(arrayBuffer);
+  if (!floatData.length) return;
+  const buf = audioCtx.createBuffer(1, floatData.length, 16000);
+  buf.copyToChannel(floatData, 0);
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(audioCtx.destination);
+  const now = audioCtx.currentTime;
+  if (nextPlaybackTime < now + 0.02) nextPlaybackTime = now + 0.02;
+  src.start(nextPlaybackTime);
+  nextPlaybackTime += buf.duration;
+}
+
+async function attachScriptProcessorFallback() {
+  captureNode = audioCtx.createScriptProcessor(4096, 1, 1);
+  let buf = new Float32Array(0);
+  captureNode.onaudioprocess = (e) => {
+    const input = e.inputBuffer.getChannelData(0);
+    const merged = new Float32Array(buf.length + input.length);
+    merged.set(buf, 0);
+    merged.set(input, buf.length);
+    buf = merged;
+    while (buf.length >= 2560) {
+      const chunk = buf.slice(0, 2560);
+      buf = buf.slice(2560);
+      if (audioWs && audioWs.readyState === WebSocket.OPEN) audioWs.send(chunk.buffer);
+    }
+  };
+  sourceNode.connect(captureNode);
+  captureNode.connect(silentGain);
+}
+
+async function attachWorkletCapture() {
+  const blob = new Blob([WORKLET_SOURCE], { type: "application/javascript" });
+  const url = URL.createObjectURL(blob);
+  await audioCtx.audioWorklet.addModule(url);
+  captureNode = new AudioWorkletNode(audioCtx, "pcm-chunker");
+  captureNode.port.onmessage = (ev) => {
+    if (audioWs && audioWs.readyState === WebSocket.OPEN) audioWs.send(ev.data.buffer);
+  };
+  sourceNode.connect(captureNode);
+  captureNode.connect(silentGain);
+}
+
+async function start() {
+  if (running) return;
+  document.getElementById("mic-error").textContent = "";
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1, sampleRate: 16000 },
+    });
+  } catch (err) {
+    document.getElementById("mic-error").textContent = "mic permission denied: " + err.message;
+    return;
+  }
+
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+  await audioCtx.resume();
+  sourceNode = audioCtx.createMediaStreamSource(micStream);
+  silentGain = audioCtx.createGain();
+  silentGain.gain.value = 0; // keep the capture node pulled by the graph without audible passthrough
+  silentGain.connect(audioCtx.destination);
+
+  nextPlaybackTime = 0;
+  audioWs = new WebSocket(wsUrl("/audio"));
+  audioWs.binaryType = "arraybuffer";
+  audioWs.onopen = () => setChip("chip-audio", "audio: live", "on");
+  audioWs.onmessage = (ev) => playback(ev.data);
+  audioWs.onclose = () => { if (running) setChip("chip-audio", "audio: disconnected", "bad"); };
+
+  if (audioCtx.audioWorklet) {
+    try {
+      await attachWorkletCapture();
+    } catch (err) {
+      console.warn("AudioWorklet failed, falling back to ScriptProcessor", err);
+      await attachScriptProcessorFallback();
+    }
+  } else {
+    await attachScriptProcessorFallback();
+  }
+
+  running = true;
+  setChip("chip-mic", "mic: live", "on");
+  updateButton();
+}
+
+function stop() {
+  running = false;
+  try { audioWs && audioWs.close(); } catch (e) {}
+  try { captureNode && captureNode.disconnect(); } catch (e) {}
+  try { sourceNode && sourceNode.disconnect(); } catch (e) {}
+  try { silentGain && silentGain.disconnect(); } catch (e) {}
+  try { micStream && micStream.getTracks().forEach((t) => t.stop()); } catch (e) {}
+  try { audioCtx && audioCtx.close(); } catch (e) {}
+  audioWs = null; audioCtx = null; sourceNode = null; captureNode = null; silentGain = null; micStream = null;
+  setChip("chip-mic", "mic: off", "");
+  setChip("chip-audio", "audio: off", "");
+  updateButton();
+}
+
+function updateButton() {
+  const btn = document.getElementById("btn-start-stop");
+  btn.textContent = running ? "Stop" : "Start";
+  btn.classList.toggle("running", running);
+}
+
+function toggle() {
+  if (running) stop(); else start();
+}
+
+// --- wire it up ------------------------------------------------------------------
+
+document.getElementById("btn-start-stop").addEventListener("click", toggle);
+document.getElementById("inject-form").addEventListener("submit", onInjectSubmit);
+connectEvents();
+pollState();
+setInterval(pollState, 500);
+</script>

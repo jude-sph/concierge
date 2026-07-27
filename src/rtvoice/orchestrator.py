@@ -9,6 +9,25 @@ from __future__ import annotations
 import asyncio
 import uuid
 
+# Imported at module level, not lazily inside create_app: `from __future__
+# import annotations` (above) turns every annotation in this file into a
+# string, resolved later via typing.get_type_hints() against the function's
+# __globals__. FastAPI relies on exactly that resolution to recognise a
+# `ws: WebSocket` parameter as "inject the connection", not a query param.
+# A name that only exists in create_app's *local* scope (as it did when this
+# was `from fastapi import WebSocket` inside the function body) is invisible
+# to get_type_hints, which resolves against module globals -- so every
+# websocket route silently degraded to expecting `ws` as a query parameter
+# and closed the connection with code 1008 before the handler ever ran. This
+# had no test covering it (nothing here previously drove a websocket through
+# real FastAPI request handling) until the /audio route below did.
+# FastAPI itself has no import-time side effects (no filesystem or network
+# access), so hoisting this above create_app does not reintroduce what
+# test_importing_the_orchestrator_module_has_no_side_effects guards against --
+# that only forbids *constructing an app* (or a device, or a log) at import
+# time, which still happens nowhere but inside create_app / create_default_app.
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from .cancellation import CancellationToken
@@ -515,12 +534,18 @@ class Inject(BaseModel):
 def create_app(orch: Orchestrator) -> "FastAPI":
     """HTTP/WS surface. /inject is the development affordance that lets the
     whole loop be exercised without a microphone."""
-    from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-
-    from .states import TurnEvent, UserState
+    from .audio_ws import install_audio_route
 
     app = FastAPI()
     app.state.orch = orch
+
+    install_audio_route(app, orch)
+
+    @app.get("/", response_class=HTMLResponse)
+    async def index() -> str:
+        from pathlib import Path
+
+        return (Path(__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
 
     @app.post("/inject")
     async def inject(body: Inject) -> dict:
@@ -584,9 +609,13 @@ def build_default_orchestrator(session_dir=None) -> Orchestrator:
     log = EventLog(session / "events.jsonl")
     voice = VoiceService(session, os.environ.get("SOULX_URL", "ws://localhost:8000/turn"))
     concierge = Concierge(base_url=os.environ.get("CONCIERGE_URL", "http://localhost:8001/v1"))
+    # Off by default: the concierge needs a vLLM server, which the v1 demo
+    # does not require. Set USE_CONCIERGE=1 to turn it on once that's running.
+    use_concierge = os.environ.get("USE_CONCIERGE", "0").strip().lower() in ("1", "true", "yes")
     return Orchestrator(
         reasoner=ReasonerStub(device, latency_ms=int(os.environ.get("REASONER_LATENCY_MS", "0"))),
         concierge=concierge, voice=voice, log=log, device=device,
+        use_concierge=use_concierge,
     )
 
 
