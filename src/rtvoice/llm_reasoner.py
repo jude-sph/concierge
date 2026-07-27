@@ -56,6 +56,13 @@ DESTRUCTIVE = ("update", "delete", "insert")
 # only produce a confidently wrong row count.
 _SCALARS = (str, int, float, bool)
 
+# DeviceState matches by exact equality; there is no pattern syntax. A model
+# that writes one of these into "where" anyway (instead of omitting "where"
+# to mean "every row") would otherwise match nothing and be read as a normal,
+# honest "no matches" -- indistinguishable from a filter that just happens to
+# be wrong. Rejecting it outright surfaces the real problem instead.
+_WILDCARD_VALUES = ("*", "%")
+
 SYSTEM_PROMPT = """You are the reasoning system inside a voice assistant that \
 operates the memory on a phone.
 
@@ -94,6 +101,12 @@ RULES:
   WHICH rows to find, described by their CURRENT values; "values" is what to
   set on them. A new value must NEVER appear in "where" - if it does, the
   update will match nothing, because the row does not have the new value yet.
+  This includes "set/change ALL my X to Y": Y is the new value, so it goes in
+  "values" only - never copy it into "where" too.
+- Filters match by EXACT equality only. There is no *, %, LIKE, or range
+  syntax on this device - never invent one. To act on every row in a table,
+  OMIT "where" entirely (or use {}); that is the only correct way to mean
+  "all of them".
 - NEVER count anything, and never say how many records are affected. You do
   not know, and the system computes it itself from the device.
 - If you cannot tell what was meant, use "none". Do not guess at a write.
@@ -112,6 +125,21 @@ EXAMPLES (table names and dates below are illustrative, not the real device):
   {"intents": [{"operation": "update", "table": "contacts",
     "where": {"group": "work"}, "values": {"first_name": "Hans"},
     "understood_as": "rename work contacts to Hans"}]}
+
+  "set all my contacts to Hans" ->
+  {"intents": [{"operation": "update", "table": "contacts",
+    "values": {"first_name": "Hans"},
+    "understood_as": "rename all contacts to Hans"}]}
+  Note: EVERY contact, not some of them, so "where" is OMITTED entirely -
+  not filled with "Hans" (that is the new value, it belongs only in
+  "values") and not filled with a wildcard (there is no such syntax).
+  Omitting "where" IS how "all rows" is said.
+
+  "delete all my messages" ->
+  {"intents": [{"operation": "delete", "table": "messages",
+    "understood_as": "delete all messages"}]}
+  Note: same pattern for the most destructive operation there is - "where"
+  omitted, never invented.
 
   "what's in my calendar tomorrow" ->
   {"intents": [{"operation": "query", "table": "calendar",
@@ -531,7 +559,7 @@ class LlmReasoner:
         if fields is None:
             return f"there's no {intent.table} on this device"
 
-        for source in (intent.where or {}, intent.values or {}):
+        for source, is_where in ((intent.where or {}, True), (intent.values or {}, False)):
             for key, value in source.items():
                 # An insert into a table with no rows yet has no known fields,
                 # so anything scalar is allowed; otherwise rows stay uniform.
@@ -539,6 +567,9 @@ class LlmReasoner:
                     return f"{intent.table} has no {key}"
                 if value is not None and not isinstance(value, _SCALARS):
                     return f"{key} can't be matched on that"
+                if is_where and value in _WILDCARD_VALUES:
+                    return (f'"{key}" can\'t be filtered with a wildcard - '
+                            'omit "where" to match every row')
 
         if intent.operation == "update" and not intent.values:
             return "nothing to change"

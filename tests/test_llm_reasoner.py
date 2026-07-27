@@ -585,6 +585,30 @@ async def test_unfiltered_update_states_the_whole_table_count(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_unfiltered_update_confirms_true_count_and_changes_every_record(tmp_path):
+    """'set all my contacts to Hans' with "where" correctly omitted -- the
+    fixed prompt's own worked example. The count the user hears must be the
+    device's true row count (4, from this fixture), and confirming must
+    actually change every one of them, not just the ones a filter happened
+    to select."""
+    reasoner, _ = build(tmp_path, plan({
+        "operation": "update", "table": "contacts",
+        "values": {"first_name": "Hans"},
+        "understood_as": "rename all contacts to Hans",
+    }))
+
+    out = await say(reasoner, "set all my contacts to Hans")
+    verbatim = only(out, "confirm_required").verbatim_text
+    assert "all 4 rows in contacts" in verbatim
+    assert names(reasoner) == ["Sarah", "Marcus", "Priya", "Tom"]  # nothing yet
+
+    done = await answer(reasoner, only(out, "confirm_required").task_id, "yes")
+    assert only(done, "done").result == (
+        'updated 4 rows in contacts: set first_name to "Hans"')
+    assert names(reasoner) == ["Hans", "Hans", "Hans", "Hans"]
+
+
+@pytest.mark.asyncio
 async def test_the_model_cannot_state_a_fact_the_user_hears(tmp_path):
     """Whatever the model puts in fact-shaped fields is dropped on the floor:
     only `understood_as` (a paraphrase of the user's own request) survives,
@@ -635,6 +659,15 @@ MALFORMED = [
     pytest.param('{"intents": [{"operation": "update", "table": "contacts",'
                  ' "where": {"group": ["work", "family"]},'
                  ' "values": {"first_name": "Hans"}}]}', id="non-scalar-filter"),
+    pytest.param('{"intents": [{"operation": "update", "table": "contacts",'
+                 ' "where": {"first_name": "*"}, "values": {"first_name": "Hans"}}]}',
+                 id="asterisk-wildcard-filter"),
+    pytest.param('{"intents": [{"operation": "update", "table": "contacts",'
+                 ' "where": {"first_name": "*", "last_name": "*"},'
+                 ' "values": {"first_name": "Hans"}}]}',
+                 id="asterisk-wildcard-filter-on-every-field"),
+    pytest.param('{"intents": [{"operation": "delete", "table": "messages",'
+                 ' "where": {"contact": "%"}}]}', id="percent-wildcard-filter"),
     pytest.param('{"intents": "rename everything"}', id="intents-not-a-list"),
     pytest.param("", id="empty-body"),
     pytest.param("null", id="null"),
@@ -667,6 +700,31 @@ async def test_malformed_llm_output_is_always_audible(tmp_path, payload):
     reasoner, _ = build(tmp_path, payload)
     out = await say(reasoner, "change all my contacts to Hans")
     assert "failed" in kinds(out) or kinds(out) == ["noop"]
+
+
+@pytest.mark.asyncio
+async def test_wildcard_filter_is_rejected_explicitly_not_read_as_zero_matches(tmp_path):
+    """'set all my contacts to hands' -- the second live-model failure. Asked
+    for every contact, the model invented a "*" filter instead of omitting
+    "where". That filter matches nothing on a real device (equality only), so
+    without this check it would be indistinguishable from an honest "no
+    matches" -- an ack + done reporting "nothing changed", which is wrong: the
+    plan was malformed, not empty. It must instead be refused outright, the
+    same safe path as any other unreadable plan, and audibly so."""
+    reasoner, _ = build(tmp_path, plan({
+        "operation": "update", "table": "contacts",
+        "where": {"first_name": "*", "last_name": "*"},
+        "values": {"first_name": "Hans"},
+        "understood_as": "set all my contacts to hands",
+    }))
+
+    out = await say(reasoner, "set all my contacts to hands")
+
+    assert kinds(out) == ["ack", "failed"]
+    assert "wildcard" in only(out, "failed").reason
+    # not the "0 matches" phrasing an empty filter would have produced
+    assert "nothing changed" not in only(out, "failed").reason
+    assert names(reasoner) == ["Sarah", "Marcus", "Priya", "Tom"]
 
 
 # --- parsing resilience: prose/fences tolerated, one retry, then fail safe ---
