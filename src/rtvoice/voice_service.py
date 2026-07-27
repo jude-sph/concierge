@@ -170,7 +170,8 @@ class VoiceService:
         soulx_url: str = "ws://localhost:8000/turn",
         *,
         tts_factory: Callable[[], object] | None = None,
-        agc: bool = True,
+        # OFF by default: measured net-harmful against the real model. See below.
+        agc: bool = False,
         agc_target_rms: float = 0.05,
         agc_target_peak: float = 0.65,
     ):
