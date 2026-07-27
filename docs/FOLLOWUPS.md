@@ -39,6 +39,30 @@ Not a data-safety bug — nothing mutates without an explicit answer-shaped affi
 Likely fix: make the silence-timeout reconciliation prefix-aware rather than exact-match, so
 the superset completion resolves the existing task instead of creating a duplicate.
 
+## Carried by the fragment merge window
+
+The turn-taking measurement above came back badly: one 21s compound instruction arrived as
+**six** `user_complete` events, because the speaker paused at clause boundaries and each
+fragment genuinely is a complete sentence. `Orchestrator.merge_window_ms` (default 1200 ms)
+now holds a finalised utterance and concatenates whatever follows before the reasoner sees
+it. Three things about it are worth knowing:
+
+- **Merging is gated on the orchestrator being clocked** (`Orchestrator._clocked`). An
+  utterance is only held if `on_tick` has already reached that event's timestamp, which is
+  always true on the audio path (`AudioDriver` ticks after every 160 ms chunk) and never
+  true for `POST /inject`, which synthesises a `COMPLETE` at t=0 and reads the resulting
+  tasks out of its own response. Without the gate, injected text would be held for a window
+  nothing was going to close. The consequence is that the merge window is inert for any
+  caller driving `on_turn_event` without `on_tick` — including most of the existing test
+  suite, which is why those tests still assert synchronous dispatch.
+- **The window alone is far too short for the measured gaps** (2.4–3.7 s between fragments).
+  What actually holds the buffer open is `user_nonidle` refreshing it while the user is
+  audibly still speaking. If echo cancellation fails and the mic hears the TTS, NONIDLE
+  becomes continuous and a merge could be held open indefinitely.
+- **`on_tick` now awaits a reasoner round trip on the common path**, not just on the rare
+  silence timeout. `on_turn_event` already did this, so it is not new, but it means a slow
+  reasoner stalls the audio feed for longer stretches than before.
+
 ## Cheap usability fixes
 
 - **The answer-shape whitelist rejects natural confirmations.** `"yes go ahead and do it"`

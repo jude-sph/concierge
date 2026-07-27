@@ -27,6 +27,7 @@ class Orchestrator:
         silence_timeout_ms: int = 2000,
         reasoner_timeout_s: float = 20.0,
         use_concierge: bool = True,
+        merge_window_ms: int = 1200,
     ) -> None:
         self.reasoner = reasoner
         self.concierge = concierge
@@ -61,6 +62,38 @@ class Orchestrator:
         # content and is dispatched normally.
         self._force_dispatched_text: str | None = None
 
+        # --- fragment merge window ------------------------------------------
+        #
+        # Measured on real hardware: SoulX-Duplug emits MULTIPLE `user_complete`
+        # events for ONE spoken command. A 21s compound instruction arrived as
+        # six turns, because the speaker paused at a clause boundary and "can
+        # you get me a booking at a chinese restaurant" genuinely IS a complete
+        # sentence. Their semantic detector is not malfunctioning: the fact
+        # that the speaker intended to continue is not present in the text.
+        # Sweeping their `max_wait_num` from 8 to 32 moved it 6 -> 4 turns,
+        # non-monotonically, and never to 1. So it is mitigated here.
+        #
+        # A finalised utterance is held for merge_window_ms and concatenated
+        # with anything that follows it, then dispatched to the reasoner ONCE.
+        # This is affordable *here specifically* because the concierge and the
+        # reasoner run in parallel: the concierge still answers immediately, so
+        # the user is acknowledged at the same latency as before and only the
+        # (already slow, already async) reasoner dispatch moves.
+        self.merge_window_ms = merge_window_ms
+        self._merge_parts: list[str] = []
+        self._merge_last_ms: int | None = None
+        # The audio clock's last position, as reported by on_tick. Holding an
+        # utterance is only safe when something will later flush it, and
+        # on_tick is that something: AudioDriver pumps it after every 160ms
+        # chunk, so a live audio session is always clocked past the timestamp
+        # of the turn event it just delivered. A turn event that arrives
+        # AHEAD of the clock did not come off the audio path at all -- POST
+        # /inject types text straight in, and its caller reads the resulting
+        # tasks from the response -- so it was never fragmented by the
+        # turn-taking model and must not be delayed by a window nothing is
+        # driving. See _clocked.
+        self._last_tick_ms: int | None = None
+
         # Speech generation counter (same pattern as tts.py's KokoroTTS): every
         # Stop() bumps it, and an in-flight _ask_concierge that captured an
         # older value knows its reply is stale and must not speak it.
@@ -83,12 +116,25 @@ class Orchestrator:
         return self._seq
 
     async def on_tick(self, now_ms: int) -> None:
-        """Drive the silence timeout. Called ~every 160ms by voice-service.
+        """Drive both timers. Called ~every 160ms on the audio clock.
 
-        SoulX-Duplug declining to take the turn is normally correct, but if it
-        never fires the system would hang. After silence_timeout_ms of holding
-        an incomplete utterance, dispatch it anyway.
+        The two handle OPPOSITE failures of the same upstream model and are
+        deliberately kept as separate buffers so they can never dispatch the
+        same words twice:
+
+        * the silence timeout covers `user_complete` never arriving -- it
+          holds an INCOMPLETE partial, and a COMPLETE clears it;
+        * the merge window covers `user_complete` arriving too OFTEN -- it
+          holds finalised COMPLETE texts, and nothing else writes to it.
         """
+        self._last_tick_ms = now_ms
+        await self._check_silence_timeout(now_ms)
+        await self._flush_merge_if_expired(now_ms)
+
+    async def _check_silence_timeout(self, now_ms: int) -> None:
+        """SoulX-Duplug declining to take the turn is normally correct, but if
+        it never fires the system would hang. After silence_timeout_ms of
+        holding an incomplete utterance, dispatch it anyway."""
         if self._pending_since_ms is None or self._pending_partial is None:
             return
         if now_ms - self._pending_since_ms < self.silence_timeout_ms:
@@ -100,6 +146,72 @@ class Orchestrator:
         self.log.append("silence_timeout", transcript=text)
         self.history.append({"role": "user", "content": text})
         await self._dispatch(text)
+
+    # --- merge window --------------------------------------------------------
+
+    def _merge_append(self, text: str, t_ms: int) -> None:
+        self._merge_parts.append(text)
+        self._merge_last_ms = t_ms
+        self.log.append("merge_pending", transcript=text,
+                        parts=len(self._merge_parts))
+
+    def _merge_take(self) -> str | None:
+        """Empty the buffer and return the concatenated utterance."""
+        if not self._merge_parts:
+            return None
+        parts, self._merge_parts = self._merge_parts, []
+        self._merge_last_ms = None
+        text = " ".join(parts)
+        if len(parts) > 1:
+            # A distinct event kind so a merge is visible in the session log
+            # and in replay -- otherwise the reasoner appears to receive text
+            # nobody said in one breath, with no record of why.
+            self.log.append("utterance_merged", parts=parts, transcript=text,
+                            count=len(parts))
+        return text
+
+    def _merge_expired(self, now_ms: int) -> bool:
+        return (self._merge_last_ms is not None
+                and now_ms - self._merge_last_ms >= self.merge_window_ms)
+
+    async def _flush_merge_if_expired(self, now_ms: int) -> None:
+        if not self._merge_expired(now_ms):
+            return
+        text = self._merge_take()
+        if text is not None:
+            await self._dispatch(text)
+
+    def _clocked(self, t_ms: int) -> bool:
+        """Is a clock running that has already reached this turn event?
+
+        Deferring an utterance is only safe if something will flush the
+        buffer. on_tick is that something, and AudioDriver pumps it after
+        every audio chunk, so during a live session the clock is always at or
+        past the timestamp of the event just delivered. An event arriving
+        ahead of the clock was not produced by the audio path -- POST /inject
+        synthesises a COMPLETE at t=0 and reads the resulting tasks straight
+        out of the response -- so it cannot be a turn-taking fragment and
+        must not be held for a window nothing is going to close.
+        """
+        return self._last_tick_ms is not None and self._last_tick_ms >= t_ms
+
+    def _bypasses_merge(self, text: str, t_ms: int) -> bool:
+        """Must this utterance go to the reasoner right now?
+
+        Answering a pending confirmation is never delayed. A "yes" resolving a
+        destructive-write confirmation is time-critical, and concatenating it
+        with whatever the user says next would both destroy its answer shape
+        (making the write impossible to confirm at all) and risk the merged
+        text being read as a fresh command. The AWAITING_CONFIRM +
+        answer-shaped test is exactly the gate _answer_target applies, through
+        the one is_answer_shaped in states.py.
+        """
+        if self.merge_window_ms <= 0:
+            return True
+        if is_answer_shaped(text) and any(t.status == TaskStatus.AWAITING_CONFIRM
+                                          for t in self.registry.all()):
+            return True
+        return not self._clocked(t_ms)
 
     async def on_turn_event(self, ev: TurnEvent) -> None:
         self.log.append("turn_event", state=ev.state.value,
@@ -118,6 +230,27 @@ class Orchestrator:
             self._pending_partial = None
             self._pending_since_ms = None
 
+        if (ev.state is UserState.NONIDLE
+                and self._merge_last_ms is not None
+                and not self._merge_expired(ev.t_ms)):
+            # The user resumed speaking inside the merge window: whatever they
+            # are saying now belongs with what is already buffered, so hold it
+            # and keep accumulating rather than dispatching a fragment. This is
+            # what makes the window work at all on real audio -- the six
+            # measured fragments were 2-4s apart, far wider than the window,
+            # but the user is audibly speaking throughout the gaps.
+            self._merge_last_ms = ev.t_ms
+
+        concurrent: list[asyncio.Task] = []
+
+        # A fragment arriving after the window has elapsed is a NEW utterance,
+        # not a continuation. Flush first, using this event's own clock, so
+        # on_tick is not the only thing that can close a merge.
+        if self._merge_expired(ev.t_ms):
+            expired = self._merge_take()
+            if expired is not None:
+                concurrent.append(asyncio.create_task(self._dispatch(expired)))
+
         # SendUtterance (-> reasoner) and AskConcierge (-> concierge) are
         # launched concurrently, never one awaited before the other starts.
         # The reasoner is the gatekeeper for device-touching work and may be
@@ -126,7 +259,6 @@ class Orchestrator:
         # this into a pipeline and make every spoken reply wait on the
         # reasoner's round trip, which is exactly the failure mode this
         # module exists to avoid.
-        concurrent: list[asyncio.Task] = []
         for action in decide(ev, self.policy_state):
             if isinstance(action, Stop):
                 await self.voice.stop()
@@ -148,8 +280,15 @@ class Orchestrator:
                     self.log.append("silence_timeout_reconciled", transcript=action.text)
                 else:
                     self._force_dispatched_text = None
+                    # History is per-fragment and immediate: the concierge
+                    # answers this fragment now, so it must see the words that
+                    # were actually just spoken, not wait for the merge.
                     self.history.append({"role": "user", "content": action.text})
-                    concurrent.append(asyncio.create_task(self._dispatch(action.text)))
+                    if self._bypasses_merge(action.text, ev.t_ms):
+                        concurrent.append(
+                            asyncio.create_task(self._dispatch(action.text)))
+                    else:
+                        self._merge_append(action.text, ev.t_ms)
 
             elif isinstance(action, AskConcierge):
                 # use_concierge=False must genuinely bypass the concierge on
