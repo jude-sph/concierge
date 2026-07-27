@@ -2288,26 +2288,25 @@ git commit -m "feat: interruptible Kokoro TTS and dual-channel session recorder"
 
 - [ ] **Step 1: Write the failing end-to-end tests**
 
+First create the shared test doubles — Task 13 reuses them, so they live in
+their own module rather than being duplicated:
+
 ```python
-# tests/test_end_to_end.py
-import json
-import pytest
-from rtvoice.device import DeviceState
-from rtvoice.events import EventLog
-from rtvoice.orchestrator import Orchestrator
-from rtvoice.reasoner_stub import ReasonerStub
-from rtvoice.registry import TaskStatus
-from rtvoice.states import TurnEvent, UserState
+# tests/fakes.py
+"""Shared test doubles. Imported as `from fakes import ...` — pytest's default
+prepend import mode puts tests/ on sys.path, and there is no tests/__init__.py.
+"""
+from rtvoice.concierge import SpeechAct
 
 
 class FakeConcierge:
     """Records what it was asked; returns a fixed acknowledge."""
+
     def __init__(self):
         self.calls = []
         self.violations = 0
 
     async def respond(self, registry, history, trigger):
-        from rtvoice.concierge import SpeechAct
         self.calls.append((registry.fact_block(), trigger))
         return SpeechAct(act="acknowledge", text="on it")
 
@@ -2322,6 +2321,21 @@ class FakeVoice:
 
     async def stop(self):
         self.stops += 1
+```
+
+```python
+# tests/test_end_to_end.py
+import json
+
+import pytest
+from fakes import FakeConcierge, FakeVoice
+
+from rtvoice.device import DeviceState
+from rtvoice.events import EventLog
+from rtvoice.orchestrator import Orchestrator
+from rtvoice.reasoner_stub import ReasonerStub
+from rtvoice.registry import TaskStatus
+from rtvoice.states import TurnEvent, UserState
 
 
 @pytest.fixture
@@ -2723,7 +2737,7 @@ from rtvoice.orchestrator import Orchestrator
 from rtvoice.protocol import ReasonerMessage
 from rtvoice.reasoner_stub import ReasonerStub
 from rtvoice.states import TurnEvent, UserState
-from tests.test_end_to_end import FakeConcierge, FakeVoice
+from fakes import FakeConcierge, FakeVoice
 
 
 def make(tmp_path, **kw):
@@ -2918,6 +2932,8 @@ Closes the spec's "standing instruments" and testing Layer 2.
 
 ```python
 # tests/test_instruments.py
+import pytest
+
 from rtvoice.events import Event
 from rtvoice.instruments import latency_report, violation_rate
 
@@ -2959,9 +2975,6 @@ def test_violation_rate_is_violations_over_acts():
         ev("concierge_act", 2, act="chat", violations=1),
     ]
     assert violation_rate(events) == pytest.approx(1 / 3)
-
-
-import pytest  # noqa: E402
 ```
 
 - [ ] **Step 2: Run them and watch them fail**
