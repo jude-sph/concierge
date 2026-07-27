@@ -1,15 +1,44 @@
 {
   "contacts": [
-    {"id": 1, "first_name": "Sarah",  "last_name": "Chen",    "group": "work"},
-    {"id": 2, "first_name": "Marcus", "last_name": "Webb",    "group": "work"},
-    {"id": 3, "first_name": "Priya",  "last_name": "Nair",    "group": "family"},
-    {"id": 4, "first_name": "Tom",    "last_name": "Okafor",  "group": "friends"}
+    {"id": 1,  "first_name": "Sarah",  "last_name": "Chen",      "phone": "+44 7700 900101", "email": "sarah.chen@example.com",  "group": "work",    "favourite": true},
+    {"id": 2,  "first_name": "Marcus", "last_name": "Webb",      "phone": "+44 7700 900102", "email": "m.webb@example.com",      "group": "work",    "favourite": false},
+    {"id": 3,  "first_name": "Aisha",  "last_name": "Rahman",    "phone": "+44 7700 900103", "email": "a.rahman@example.com",    "group": "work",    "favourite": false},
+    {"id": 4,  "first_name": "Daniel", "last_name": "Okonkwo",   "phone": "+44 7700 900104", "email": "daniel.o@example.com",    "group": "work",    "favourite": false},
+    {"id": 5,  "first_name": "Priya",  "last_name": "Nair",      "phone": "+44 7700 900105", "email": "priya.nair@example.com",  "group": "family",  "favourite": true},
+    {"id": 6,  "first_name": "Rohan",  "last_name": "Nair",      "phone": "+44 7700 900106", "email": "rohan.nair@example.com",  "group": "family",  "favourite": false},
+    {"id": 7,  "first_name": "Elena",  "last_name": "Vasquez",   "phone": "+44 7700 900107", "email": "elena.v@example.com",     "group": "family",  "favourite": false},
+    {"id": 8,  "first_name": "Tom",    "last_name": "Okafor",    "phone": "+44 7700 900108", "email": "tom.okafor@example.com",  "group": "friends", "favourite": true},
+    {"id": 9,  "first_name": "Yuki",   "last_name": "Tanaka",    "phone": "+44 7700 900109", "email": "yuki.t@example.com",      "group": "friends", "favourite": false},
+    {"id": 10, "first_name": "Freya",  "last_name": "Lindqvist", "phone": "+44 7700 900110", "email": "freya.l@example.com",     "group": "friends", "favourite": false},
+    {"id": 11, "first_name": "Omar",   "last_name": "Haddad",    "phone": "+44 7700 900111", "email": "omar.haddad@example.com", "group": "friends", "favourite": false}
   ],
   "messages": [
-    {"id": 1, "to": "Sarah Chen", "body": "running late", "sent": "2026-07-26"}
+    {"id": 1, "contact": "Aisha Rahman", "body": "signed off on the budget",      "sent": "2026-07-24", "read": true},
+    {"id": 2, "contact": "Yuki Tanaka",  "body": "happy birthday!",               "sent": "2026-07-24", "read": true},
+    {"id": 3, "contact": "Tom Okafor",   "body": "cinema on friday?",             "sent": "2026-07-25", "read": true},
+    {"id": 4, "contact": "Marcus Webb",  "body": "running late for standup",      "sent": "2026-07-26", "read": true},
+    {"id": 5, "contact": "Marcus Webb",  "body": "did you see the deck?",         "sent": "2026-07-26", "read": false},
+    {"id": 6, "contact": "Sarah Chen",   "body": "dinner still on?",              "sent": "2026-07-26", "read": true},
+    {"id": 7, "contact": "Priya Nair",   "body": "call mum tonight",              "sent": "2026-07-26", "read": false},
+    {"id": 8, "contact": "Marcus Webb",  "body": "moving the review to Thursday", "sent": "2026-07-27", "read": false},
+    {"id": 9, "contact": "Sarah Chen",   "body": "sent you the address",          "sent": "2026-07-27", "read": false}
   ],
   "calendar": [
-    {"id": 1, "title": "standup", "when": "2026-07-28T09:00"}
+    {"id": 1, "title": "standup",          "day": "2026-07-27", "when": "2026-07-27T09:00", "location": "Office",                "attendees": "Sarah Chen, Marcus Webb"},
+    {"id": 2, "title": "design review",    "day": "2026-07-28", "when": "2026-07-28T11:00", "location": "Office",                "attendees": "Aisha Rahman"},
+    {"id": 3, "title": "dentist",          "day": "2026-07-28", "when": "2026-07-28T16:30", "location": "Waverley Dental",       "attendees": ""},
+    {"id": 4, "title": "lunch with Priya", "day": "2026-07-29", "when": "2026-07-29T13:00", "location": "Bao House",             "attendees": "Priya Nair"},
+    {"id": 5, "title": "sprint planning",  "day": "2026-07-30", "when": "2026-07-30T10:00", "location": "Office",                "attendees": "Sarah Chen, Marcus Webb, Daniel Okonkwo"},
+    {"id": 6, "title": "cinema",           "day": "2026-07-31", "when": "2026-07-31T19:30", "location": "Prince Charles Cinema", "attendees": "Tom Okafor"}
   ],
-  "places": []
+  "places": [
+    {"id": 1, "name": "Golden Lotus",    "cuisine": "chinese",       "area": "Soho",          "rating": 4.5, "saved": false},
+    {"id": 2, "name": "Jade Garden",     "cuisine": "chinese",       "area": "Soho",          "rating": 4.2, "saved": true},
+    {"id": 3, "name": "Red Lantern",     "cuisine": "chinese",       "area": "Chinatown",     "rating": 4.7, "saved": false},
+    {"id": 4, "name": "Bao House",       "cuisine": "taiwanese",     "area": "Soho",          "rating": 4.4, "saved": true},
+    {"id": 5, "name": "Soho Sushi",      "cuisine": "japanese",      "area": "Soho",          "rating": 4.1, "saved": false},
+    {"id": 6, "name": "Green Fig",       "cuisine": "mediterranean", "area": "Soho",          "rating": 4.6, "saved": false},
+    {"id": 7, "name": "Trattoria Verde", "cuisine": "italian",       "area": "Covent Garden", "rating": 4.3, "saved": true},
+    {"id": 8, "name": "Bombay Rail",     "cuisine": "indian",        "area": "Shoreditch",    "rating": 4.8, "saved": false}
+  ]
 }

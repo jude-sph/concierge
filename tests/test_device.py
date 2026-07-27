@@ -91,6 +91,136 @@ def test_query_returns_deep_copies(dev):
         "query() must return deep copies, not live references"
 
 
+# --- delete ------------------------------------------------------------------
+
+
+def test_delete_respects_where(dev):
+    assert dev.delete("contacts", {"group": "work"}) == 2
+    assert [c["first_name"] for c in dev.query("contacts")] == ["Priya"]
+
+
+def test_delete_without_a_filter_empties_the_table(dev):
+    assert dev.delete("contacts") == 3
+    assert dev.query("contacts") == []
+
+
+def test_delete_is_not_visible_until_commit(dev):
+    dev.delete("contacts", {"group": "work"})
+    on_disk = json.loads(dev.state_path.read_text())
+    assert len(on_disk["contacts"]) == 3
+    dev.commit()
+    assert len(json.loads(dev.state_path.read_text())["contacts"]) == 1
+
+
+def test_rollback_restores_deleted_rows(dev):
+    dev.delete("contacts")
+    dev.rollback()
+    assert [c["first_name"] for c in dev.query("contacts")] == ["Sarah", "Marcus", "Priya"]
+    dev.commit()
+    assert len(json.loads(dev.state_path.read_text())["contacts"]) == 3
+
+
+def test_cancellation_stops_mid_delete_and_rolls_back(dev):
+    class CancelAfterOne(CancellationToken):
+        def __init__(self):
+            super().__init__()
+            self.n = 0
+
+        def check(self):
+            self.n += 1
+            if self.n > 1:
+                raise Cancelled()
+
+    with pytest.raises(Cancelled):
+        dev.delete("contacts", token=CancelAfterOne())
+
+    # exactly one row gone: the token is checked BEFORE each record is decided
+    assert [c["first_name"] for c in dev.query("contacts")] == ["Marcus", "Priya"]
+
+    dev.rollback()
+    dev.commit()
+    assert [c["first_name"] for c in dev.query("contacts")] == ["Sarah", "Marcus", "Priya"]
+
+
+def test_journal_records_delete_and_cancelled_delete(dev):
+    dev.delete("contacts", {"group": "work"})
+
+    class Immediate(CancellationToken):
+        def check(self):
+            raise Cancelled()
+
+    with pytest.raises(Cancelled):
+        dev.delete("contacts", token=Immediate())
+
+    entries = [json.loads(l) for l in dev.journal_path.read_text().splitlines() if l.strip()]
+    done = next(e for e in entries if e["op"] == "delete" and not e.get("cancelled"))
+    assert done["table"] == "contacts" and done["rows"] == 2
+    cancelled = next(e for e in entries if e["op"] == "delete" and e.get("cancelled"))
+    assert cancelled["rows"] == 0
+
+
+# --- insert ------------------------------------------------------------------
+
+
+def test_insert_assigns_an_id_and_returns_the_record(dev):
+    created = dev.insert("contacts", {"first_name": "Hans", "group": "work"})
+    assert created["id"] == 4
+    assert created["first_name"] == "Hans"
+    assert len(dev.query("contacts")) == 4
+
+
+def test_insert_ignores_a_caller_supplied_id(dev):
+    """A duplicate id makes every later where={"id": n} ambiguous, and the
+    caller in this system is a language model."""
+    created = dev.insert("contacts", {"id": 1, "first_name": "Hans"})
+    assert created["id"] == 4
+    assert len(dev.query("contacts", {"id": 1})) == 1
+
+
+def test_insert_into_a_table_that_does_not_exist_yet(dev):
+    created = dev.insert("reminders", {"title": "call the dentist"})
+    assert created["id"] == 1
+    assert dev.query("reminders") == [created]
+
+
+def test_insert_is_not_visible_until_commit(dev):
+    dev.insert("contacts", {"first_name": "Hans"})
+    assert len(json.loads(dev.state_path.read_text())["contacts"]) == 3
+    dev.commit()
+    assert len(json.loads(dev.state_path.read_text())["contacts"]) == 4
+
+
+def test_rollback_discards_a_staged_insert(dev):
+    dev.insert("contacts", {"first_name": "Hans"})
+    dev.rollback()
+    assert [c["first_name"] for c in dev.query("contacts")] == ["Sarah", "Marcus", "Priya"]
+
+
+def test_insert_honours_a_fired_token(dev):
+    class Immediate(CancellationToken):
+        def check(self):
+            raise Cancelled()
+
+    with pytest.raises(Cancelled):
+        dev.insert("contacts", {"first_name": "Hans"}, token=Immediate())
+    assert len(dev.query("contacts")) == 3
+
+
+def test_insert_returns_a_copy_not_a_live_reference(dev):
+    created = dev.insert("contacts", {"first_name": "Hans"})
+    created["first_name"] = "MUTATED"
+    assert dev.query("contacts", {"id": 4})[0]["first_name"] == "Hans"
+
+
+def test_journal_records_insert(dev):
+    dev.insert("contacts", {"first_name": "Hans"})
+    entries = [json.loads(l) for l in dev.journal_path.read_text().splitlines() if l.strip()]
+    rec = next(e for e in entries if e["op"] == "insert")
+    assert rec["table"] == "contacts"
+    assert rec["record"]["first_name"] == "Hans"
+    assert rec["record"]["id"] == 4
+
+
 def test_journal_records_cancelled_update(dev):
     """Cancelled updates must be journaled with partial row count and cancelled flag."""
     class CancelAfterOne(CancellationToken):
