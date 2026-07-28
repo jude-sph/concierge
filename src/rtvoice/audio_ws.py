@@ -124,12 +124,20 @@ def install_audio_route(app, orch) -> None:
                     continue
                 chunks, buffer = chunk_pcm_bytes(buffer, data)
                 for chunk in chunks:
-                    await driver.feed(chunk)
+                    # submit(), not feed(): this loop must return to
+                    # receive_bytes at the speed of the turn-taking model, not
+                    # at the speed of answering. feed() handles the turn
+                    # inline, and handling a turn ends in speaking it -- which
+                    # blocks for the whole duration of the reply. Live, that
+                    # left the microphone unread for seconds at a time and the
+                    # pipeline 4-22s behind real time. See AudioDriver.
+                    await driver.submit(chunk)
         except WebSocketDisconnect:
             pass
         except Exception as exc:
             orch.log.append("audio_ws_error", error=repr(exc), error_type=type(exc).__name__)
         finally:
+            await driver.aclose()
             orch.voice.on_audio_chunk = previous_hook
             orch.voice.on_playback_cancel = previous_cancel_hook
             orch.log.append("audio_ws_disconnected")

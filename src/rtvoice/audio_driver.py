@@ -19,6 +19,7 @@ Two things it is responsible for getting right:
 """
 from __future__ import annotations
 
+import asyncio
 from typing import AsyncIterable, Callable, Iterable
 
 import numpy as np
@@ -44,14 +45,87 @@ class AudioDriver:
         self._clock = clock if clock is not None else (lambda: voice.stream_ms)
         self._last_tick_ms = 0
         self.chunks_fed = 0
+        # Live-audio stage two (see start/submit). None until started, so
+        # every existing caller of feed() is completely unaffected.
+        self._turns: "asyncio.Queue | None" = None
+        self._worker: "asyncio.Task | None" = None
 
     async def feed(self, chunk: np.ndarray) -> list[TurnEvent]:
+        """Feed one chunk and handle whatever it produced, inline.
+
+        Everything happens before this returns, which is what every test and
+        every file-replay wants. A LIVE microphone must not use this -- see
+        `start()` and `submit()` below for why.
+        """
         events = await self.voice.feed_audio(chunk)
         self.chunks_fed += 1
         for ev in events:
             await self.orch.on_turn_event(ev)
         await self.tick()
         return events
+
+    # --- live audio: two stages, so the microphone is never blocked ----------
+    #
+    # `feed` above does everything in one call, and for a live microphone that
+    # is wrong. Handling a turn means running the reasoner (~2s) and then
+    # speaking the reply, and speaking BLOCKS FOR THE DURATION OF THE AUDIO --
+    # deliberately, because that is what makes barge-in possible (see
+    # VoiceService.speak). Do that inline and the next chunk is not read until
+    # the system has finished talking.
+    #
+    # It did exactly that. Measured across live sessions by comparing the
+    # audio clock against the wall clock, the pipeline ran 4-22 SECONDS behind
+    # real time and never recovered. That is what "sometimes my speech takes
+    # 5+ seconds to appear" was: not slow recognition -- Whisper is 0.01-0.24s
+    # and SoulX averages 112ms against a 160ms budget -- but a backlog of
+    # audio nobody had read yet.
+    #
+    # So the two jobs are separated. Stage one feeds the turn-taking model and
+    # nothing else, which comfortably beats real time. Stage two consumes the
+    # turn events it produces and may take as long as it likes. A queue joins
+    # them, so a slow reply delays only replies.
+    #
+    # Both stages stay strictly ordered (one consumer each, FIFO): turn events
+    # must reach the orchestrator in the order they happened, or a `speak`
+    # could be processed before the `nonidle` that preceded it.
+
+    async def start(self) -> None:
+        """Begin the turn-handling stage. Call once before submit()."""
+        if self._turns is None:
+            self._turns = asyncio.Queue()
+            self._worker = asyncio.create_task(self._handle_turns())
+
+    async def submit(self, chunk: np.ndarray) -> None:
+        """Feed one chunk of LIVE audio and return as soon as the turn-taking
+        model has seen it. Turn handling happens elsewhere."""
+        if self._turns is None:
+            await self.start()
+        events = await self.voice.feed_audio(chunk)
+        self.chunks_fed += 1
+        self._turns.put_nowait((events, int(self._clock())))
+
+    async def _handle_turns(self) -> None:
+        while True:
+            events, now_ms = await self._turns.get()
+            try:
+                for ev in events:
+                    await self.orch.on_turn_event(ev)
+                if now_ms - self._last_tick_ms >= self.tick_interval_ms:
+                    self._last_tick_ms = now_ms
+                    await self.orch.on_tick(now_ms)
+            except Exception as exc:
+                # One bad turn must not end the session: this task is the only
+                # consumer, and if it dies every later turn is silently lost.
+                self.orch.log.append("turn_handler_error", error=repr(exc),
+                                     error_type=type(exc).__name__)
+            finally:
+                self._turns.task_done()
+
+    async def aclose(self) -> None:
+        if self._worker is not None:
+            self._worker.cancel()
+            self._worker = None
+            self._turns = None
 
     async def tick(self) -> bool:
         """Pump the orchestrator's timer if enough audio has gone by."""

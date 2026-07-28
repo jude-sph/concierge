@@ -11,8 +11,10 @@ None of this can be verified end to end here (no GPU, `kokoro` is not
 installed, the remote turn-taking server is unreachable), so these tests
 exercise the seams with fakes.
 """
+import asyncio
 import json
 import shutil
+import time
 import subprocess
 import sys
 from pathlib import Path
@@ -362,3 +364,104 @@ def test_wav_reader_downmixes_stereo_to_mono(tmp_path):
     assert audio.ndim == 1
     assert audio.shape == (1600,)
     assert audio[0] == pytest.approx(0.5, abs=1e-3)   # PCM_16 quantisation
+
+
+# --- the microphone must never wait for the reply ---------------------------
+#
+# Handling a turn runs the reasoner and then SPEAKS, and speaking blocks for
+# the whole duration of the audio (deliberately -- that is what makes barge-in
+# possible). Done inline, the next chunk is not read until the system has
+# finished talking. Measured live by comparing the audio clock against the
+# wall clock, the pipeline ran 4-22 SECONDS behind real time and never caught
+# up: that is what "my speech takes 5+ seconds to appear" actually was.
+
+class SlowTurnOrch:
+    """An orchestrator whose turn handling takes far longer than a chunk."""
+
+    def __init__(self, delay=0.4):
+        self.delay = delay
+        self.seen = []
+        self.log = EventLog(None) if False else _NullLog()
+
+    async def on_turn_event(self, ev):
+        await asyncio.sleep(self.delay)
+        self.seen.append(ev.transcript)
+
+    async def on_tick(self, now_ms):
+        pass
+
+
+class _NullLog:
+    def append(self, kind, **kw):
+        pass
+
+
+class TickingVoice:
+    """Emits one turn event per chunk, instantly."""
+
+    def __init__(self):
+        self._t = 0
+
+    @property
+    def stream_ms(self):
+        return self._t
+
+    async def feed_audio(self, chunk):
+        self._t += 160
+        return [TurnEvent(UserState.COMPLETE, f"chunk-{self._t}", self._t)]
+
+
+@pytest.mark.asyncio
+async def test_submitting_audio_does_not_wait_for_turn_handling():
+    """The whole point: stage one returns at the speed of the turn-taking
+    model, whatever stage two is busy with."""
+    orch = SlowTurnOrch(delay=0.3)
+    driver = AudioDriver(TickingVoice(), orch)
+    await driver.start()
+
+    started = time.monotonic()
+    for _ in range(5):
+        await driver.submit(np.zeros(CHUNK_SAMPLES, dtype=np.float32))
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.2, f"feeding blocked for {elapsed:.2f}s of reply time"
+    assert driver.chunks_fed == 5
+    await driver.aclose()
+
+
+@pytest.mark.asyncio
+async def test_every_turn_still_arrives_and_in_order():
+    """Decoupling must not lose or reorder turns -- a `speak` processed before
+    the `nonidle` that preceded it would corrupt the policy's state."""
+    orch = SlowTurnOrch(delay=0.01)
+    driver = AudioDriver(TickingVoice(), orch)
+    await driver.start()
+
+    for _ in range(6):
+        await driver.submit(np.zeros(CHUNK_SAMPLES, dtype=np.float32))
+    await driver._turns.join()
+
+    assert orch.seen == [f"chunk-{160*(i+1)}" for i in range(6)]
+    await driver.aclose()
+
+
+@pytest.mark.asyncio
+async def test_a_failing_turn_does_not_end_the_session():
+    """The handler is the only consumer; if it dies, every later turn is
+    silently lost."""
+    class Exploding(SlowTurnOrch):
+        async def on_turn_event(self, ev):
+            if ev.transcript.endswith("160"):
+                raise RuntimeError("boom")
+            self.seen.append(ev.transcript)
+
+    orch = Exploding()
+    driver = AudioDriver(TickingVoice(), orch)
+    await driver.start()
+
+    for _ in range(3):
+        await driver.submit(np.zeros(CHUNK_SAMPLES, dtype=np.float32))
+    await driver._turns.join()
+
+    assert orch.seen == ["chunk-320", "chunk-480"]
+    await driver.aclose()

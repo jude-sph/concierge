@@ -58,6 +58,12 @@ class Orchestrator:
         # concierge answers on its own model the instant the person stops --
         # so what they HEAR is unchanged, and only the background work waits.
         merge_hold_ms: int = 2500,
+        # The hold for an utterance the turn-taking model finalised cleanly,
+        # with no hesitation anywhere in it. See _hold_ms: the model's own
+        # `user_incomplete` is what selects between the two, so the patient
+        # wait is spent on the utterances that earned it instead of on all of
+        # them.
+        merge_hold_fast_ms: int = 700,
         # Longer than the longest real command measured on this system: the
         # six-fragment recording ran 21 seconds of continuous speech. At 12s
         # this valve fired in the middle of that exact utterance, dispatching
@@ -145,10 +151,14 @@ class Orchestrator:
         # indefinitely.
         self.merge_window_ms = merge_window_ms
         self.merge_hold_ms = merge_hold_ms
+        self.merge_hold_fast_ms = merge_hold_fast_ms
         self.merge_max_hold_ms = merge_max_hold_ms
         self._merge_parts: list[str] = []
         self._merge_last_ms: int | None = None
         self._merge_first_ms: int | None = None
+        # Did the turn-taking model DECLINE the turn while this utterance was
+        # being spoken? See _hold_ms.
+        self._saw_incomplete = False
         # The audio clock's last position, as reported by on_tick. Holding an
         # utterance is only safe when something will later flush it, and
         # on_tick is that something: AudioDriver pumps it after every 160ms
@@ -237,6 +247,9 @@ class Orchestrator:
         parts, self._merge_parts = self._merge_parts, []
         self._merge_last_ms = None
         self._merge_first_ms = None
+        # The hesitation belonged to the utterance now leaving; the next one
+        # starts from a clean judgement.
+        self._saw_incomplete = False
         text = " ".join(parts)
         if len(parts) > 1:
             # A distinct event kind so a merge is visible in the session log
@@ -262,7 +275,27 @@ class Orchestrator:
         if quiet is None:
             return False
         silence = quiet(now_ms)
-        return silence is not None and silence < self.merge_hold_ms
+        return silence is not None and silence < self._hold_ms()
+
+    def _hold_ms(self) -> int:
+        """How long to wait for more, decided by the turn-taking model.
+
+        This is the one place the system uses SoulX-Duplug for what it is
+        actually for, rather than as a voice detector with extra steps.
+
+        `user_incomplete` is derived from the model going quiet WITHOUT taking
+        the turn (states.py): it heard the person stop and judged that they
+        had not finished. That judgement is exactly what distinguishes a
+        thinking pause from the end of a sentence, and it is not available
+        from energy alone -- it is why this project chose a duplex model over
+        a VAD in the first place.
+
+        So an utterance the model hesitated over is given the patient hold,
+        and one it finalised cleanly, first time, is dispatched almost at
+        once. Measured, only 15% of its turn decisions were premature -- and
+        the flat hold was charging the other 85% for them.
+        """
+        return self.merge_hold_ms if self._saw_incomplete else self.merge_hold_fast_ms
 
     def _merge_expired(self, now_ms: int) -> bool:
         if self._merge_last_ms is None:
@@ -327,6 +360,14 @@ class Orchestrator:
     async def on_turn_event(self, ev: TurnEvent) -> None:
         self.log.append("turn_event", state=ev.state.value,
                         transcript=ev.transcript, t_ms=ev.t_ms)
+
+        if ev.state is UserState.INCOMPLETE:
+            # The model heard them stop and declined to take the turn. That is
+            # the signal _hold_ms uses to decide this speaker is mid-thought
+            # and worth waiting for -- recorded even when the partial
+            # transcript is empty, because the judgement is in the STATE, not
+            # in whatever words happened to be recognised alongside it.
+            self._saw_incomplete = True
 
         if ev.state is UserState.INCOMPLETE and ev.transcript.strip():
             self._pending_partial = ev.transcript
