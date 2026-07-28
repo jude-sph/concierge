@@ -379,6 +379,46 @@ def _rendered_update(table: str, where: dict | None, values: dict, n: int,
     return f"{update} {_scope_phrase(table, where, n)}: {new}", ""
 
 
+def _capitalized(s: str) -> str:
+    """`s` with its first character upper-cased -- for turning an action
+    description (always written lower-case, since it is also spoken mid
+    sentence elsewhere) into the start of a standalone question."""
+    return s[:1].upper() + s[1:] if s else s
+
+
+def _confirm_question(action: str, count_clause: str = "") -> str:
+    """A destructive write's confirmation, phrased as one short question a
+    person would actually ask -- never "This will X. Confirm?", which reads
+    like a log line, not speech. A live session had a user hear exactly that
+    read aloud, internals-adjacent phrasing and all:
+    "This will rename Sarah to Michael. 1 contact. Confirm?"
+
+    `action` already states the write and, via `_scope_phrase`, its blast
+    radius -- except in the one shape that can't: renaming a single record
+    identified by name reads best as "rename Sarah to Michael", which has no
+    room left for the count the user's consent depends on. That count is
+    carried separately in `count_clause` (see `_rendered_update`) and, when
+    present, becomes its own short trailing sentence ("That's 1 contact.")
+    rather than a second clause dangling off the same one. Either way, the
+    exact count is never dropped, softened, or reworded here -- only how the
+    words around it are arranged changes.
+    """
+    question = f"{_capitalized(action)}?"
+    if count_clause:
+        question += f" That's {count_clause.strip().rstrip('.')}."
+    return question
+
+
+def _delete_confirm_question(table: str, where: dict | None, n: int) -> str:
+    """Same idea as `_confirm_question`, for delete -- which must also never
+    let an unfiltered delete (the most destructive thing this device can do)
+    read as anything vaguer than "empties it completely", in plain words,
+    not a technical aside.
+    """
+    emptied = ", leaving nothing" if not where else ""
+    return f"{_capitalized(f'delete {_scope_phrase(table, where, n)}{emptied}')}?"
+
+
 def _spoken(value: Any) -> str:
     """Like `_fmt`, but for text that is read aloud rather than echoed as a
     quoted literal: a spoken sentence has no use for JSON-style quote marks
@@ -861,9 +901,9 @@ class LlmReasoner:
                     # unquoted "field value" style already used for reading a
                     # matched row aloud (_row_summary). An insert never has a
                     # model-claimed count to distrust -- it is always exactly
-                    # one record -- so there is no count to state here.
-                    verbatim_text=f"This will add to {table}: "
-                                  f"{_row_summary(values)}. Confirm?",
+                    # one record -- so there is no count to state here. One
+                    # short question, not "This will X. Confirm?".
+                    verbatim_text=f"Add to {table}: {_row_summary(values)}?",
                 ),
             ]
 
@@ -879,7 +919,7 @@ class LlmReasoner:
             understood = f"{_describe_values(values)} in {table} where {_describe_where(where)}"
             nothing = f"no {_noun(table, 0)} matched, so nothing changed"
             action, count_clause = _rendered_update(table, where, values, n, past=False)
-            question = f"This will {action}.{count_clause} Confirm?"
+            question = _confirm_question(action, count_clause)
         else:
             understood = f"delete from {table} where {_describe_where(where)}"
             nothing = f"no {_noun(table, 0)} matched, so nothing was deleted"
@@ -887,8 +927,7 @@ class LlmReasoner:
             # can do, and must not be describable as anything vaguer than what
             # it is -- "leaving nothing" alongside "all N <noun>" says so
             # twice over, in plain words, with no SQL-ish syntax.
-            emptied = ", leaving nothing" if not where else ""
-            question = f"This will delete {_scope_phrase(table, where, n)}{emptied}. Confirm?"
+            question = _delete_confirm_question(table, where, n)
 
         if n == 0:
             # Nothing matches, so there is no blast radius to consent to and no

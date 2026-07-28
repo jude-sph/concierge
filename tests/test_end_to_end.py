@@ -111,7 +111,7 @@ async def test_bare_yes_backchannel_while_speaking_confirms_destructive_write(or
                if t.status == TaskStatus.AWAITING_CONFIRM)
     assert orch.policy_state.pending_question is not None
 
-    # The system is still voicing "This will rename 2 contacts to Hans. Confirm?"
+    # The system is still voicing "Rename all 2 contacts to Hans?"
     orch.policy_state.speaking = True
 
     await orch.on_turn_event(TurnEvent(UserState.BACKCHANNEL, "yes", 1000))

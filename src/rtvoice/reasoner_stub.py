@@ -137,7 +137,9 @@ class ReasonerStub:
                                 understood_as=f"rename all contacts to {name}"),
                 ReasonerMessage(
                     kind="confirm_required", task_id=tid,
-                    verbatim_text=f"This will rename {n} contacts to {name}. Confirm?",
+                    # One short spoken question, not "This will X. Confirm?"
+                    # -- the exact count still survives verbatim.
+                    verbatim_text=f"Rename all {n} contacts to {name}?",
                 ),
             ]
 

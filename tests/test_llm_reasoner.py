@@ -224,6 +224,12 @@ async def test_renames_a_single_record_by_name(tmp_path):
     # nothing written before confirmation
     assert names(reasoner) == ["Sarah", "Marcus", "Priya", "Tom"]
 
+    # Fluent, not "This will rename Priya to Jude Hawrani. 1 contact.
+    # Confirm?" -- the live-session wording this fix replaces -- while the
+    # exact affected count still survives, verbatim.
+    assert only(out, "confirm_required").verbatim_text == (
+        "Rename Priya to Jude Hawrani? That's 1 contact.")
+
     tid = only(out, "confirm_required").task_id
     done = await answer(reasoner, tid, "yes")
     assert only(done, "done").result == "renamed Priya to Jude Hawrani. 1 contact."
@@ -241,7 +247,7 @@ async def test_scoped_update_touches_only_the_filtered_rows(tmp_path):
 
     out = await say(reasoner, "change my work contacts to Hans")
     verbatim = only(out, "confirm_required").verbatim_text
-    assert verbatim == "This will rename 2 work contacts to Hans. Confirm?"
+    assert verbatim == "Rename 2 work contacts to Hans?"
 
     await answer(reasoner, only(out, "confirm_required").task_id, "go ahead")
     assert names(reasoner) == ["Hans", "Hans", "Priya", "Tom"]
@@ -350,7 +356,7 @@ async def test_scoped_delete(tmp_path):
 
     assert kinds(out) == ["ack", "confirm_required"]
     assert only(out, "confirm_required").verbatim_text == (
-        "This will delete 3 messages sent 2026-07-26. Confirm?")
+        "Delete 3 messages sent 2026-07-26?")
     assert ids(reasoner, "messages") == [1, 2, 3, 4, 5]  # nothing gone yet
 
     done = await answer(reasoner, only(out, "confirm_required").task_id, "yes")
@@ -389,7 +395,7 @@ async def test_an_unfiltered_delete_says_it_empties_the_table(tmp_path):
     out = await say(reasoner, "get rid of my messages")
 
     assert only(out, "confirm_required").verbatim_text == (
-        "This will delete all 5 messages, leaving nothing. Confirm?")
+        "Delete all 5 messages, leaving nothing?")
     assert ids(reasoner, "messages") == [1, 2, 3, 4, 5]
 
     done = await answer(reasoner, only(out, "confirm_required").task_id, "yes")
@@ -440,8 +446,8 @@ async def test_insert(tmp_path):
 
     assert kinds(out) == ["ack", "confirm_required"]
     assert only(out, "confirm_required").verbatim_text == (
-        "This will add to calendar: title reminder, day 2026-07-28, "
-        "when 2026-07-28T09:00. Confirm?")
+        "Add to calendar: title reminder, day 2026-07-28, "
+        "when 2026-07-28T09:00?")
     assert ids(reasoner, "calendar") == [1, 2, 3]
 
     done = await answer(reasoner, only(out, "confirm_required").task_id, "yes")
@@ -594,7 +600,7 @@ async def test_delete_confirm_states_the_real_count_not_the_model_s(tmp_path):
     verbatim = only(out, "confirm_required").verbatim_text
 
     assert verbatim == (
-        "This will delete all 5 messages, leaving nothing. Confirm?")
+        "Delete all 5 messages, leaving nothing?")
     assert "3" not in verbatim
     assert ids(reasoner, "messages") == [1, 2, 3, 4, 5]
 
