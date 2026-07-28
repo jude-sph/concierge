@@ -662,6 +662,12 @@ let silentGain = null;
 let audioWs = null;
 let nextPlaybackTime = 0;
 
+// Every AudioBufferSourceNode currently scheduled or playing, so a barge-in
+// can actually stop them -- with no reference kept, there would be no way to
+// reach back into WebAudio's internal scheduling queue and silence audio
+// that was already handed to it.
+let activeSources = [];
+
 function playback(arrayBuffer) {
   if (!audioCtx) return;
   const floatData = new Float32Array(arrayBuffer);
@@ -675,6 +681,46 @@ function playback(arrayBuffer) {
   if (nextPlaybackTime < now + 0.02) nextPlaybackTime = now + 0.02;
   src.start(nextPlaybackTime);
   nextPlaybackTime += buf.duration;
+  activeSources.push(src);
+  src.onended = () => {
+    const i = activeSources.indexOf(src);
+    if (i !== -1) activeSources.splice(i, 1);
+  };
+}
+
+// --- barge-in: stop audio the instant the user starts talking -----------------
+//
+// The server already halts TTS generation on barge-in (Stop(), guarded by
+// _speech_gen/_speak_lock -- see orchestrator.py), but that only stops
+// chunks not yet produced. Anything already sent is already sitting in
+// activeSources, scheduled on the WebAudio clock, and would otherwise keep
+// playing to completion regardless of what the server does next. The server
+// signals a cancellation over the SAME /audio socket as a small text/JSON
+// control frame -- unambiguous from the binary PCM frames by WebSocket frame
+// TYPE (not by sniffing content), since binaryType is fixed to "arraybuffer"
+// for the audio frames but a text frame still arrives as a plain string
+// regardless of that setting. See audio_ws.py's on_playback_cancel.
+function cancelPlayback() {
+  for (const src of activeSources) {
+    src.onended = null; // already stopping it deliberately; not a barge-in loop
+    try { src.stop(0); } catch (e) {}
+    try { src.disconnect(); } catch (e) {}
+  }
+  activeSources = [];
+  // Reset the scheduling clock so the NEXT reply starts fresh relative to
+  // "now" instead of picking up wherever the cancelled one left off (which
+  // would otherwise front-load a long silent gap before anything new plays).
+  nextPlaybackTime = audioCtx ? audioCtx.currentTime : 0;
+}
+
+function handleAudioMessage(ev) {
+  if (typeof ev.data === "string") {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch (e) { return; }
+    if (msg && msg.type === "cancel") cancelPlayback();
+    return;
+  }
+  playback(ev.data);
 }
 
 async function attachScriptProcessorFallback() {
@@ -731,7 +777,7 @@ async function start() {
   audioWs = new WebSocket(wsUrl("/audio"));
   audioWs.binaryType = "arraybuffer";
   audioWs.onopen = () => setChip("chip-audio", "audio live", "");
-  audioWs.onmessage = (ev) => playback(ev.data);
+  audioWs.onmessage = handleAudioMessage;
   audioWs.onclose = () => { if (running) setChip("chip-audio", "audio disconnected", "bad"); };
 
   if (audioCtx.audioWorklet) {
@@ -759,6 +805,8 @@ function stop() {
   try { micStream && micStream.getTracks().forEach((t) => t.stop()); } catch (e) {}
   try { audioCtx && audioCtx.close(); } catch (e) {}
   audioWs = null; audioCtx = null; sourceNode = null; captureNode = null; silentGain = null; micStream = null;
+  activeSources = [];
+  nextPlaybackTime = 0;
   setChip("chip-mic", "mic off", "");
   setChip("chip-audio", "audio off", "");
   updateButton();

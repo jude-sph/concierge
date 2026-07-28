@@ -84,20 +84,29 @@ def test_chunk_pcm_bytes_handles_uneven_byte_boundaries_not_aligned_to_samples()
 
 class FakeAudioVoice:
     """Stands in for VoiceService: matches the surface AudioDriver and the
-    /audio route both need (feed_audio, stream_ms, on_audio_chunk, speak,
-    stop), without a GPU, kokoro, or a turn-taking server."""
+    /audio route both need (feed_audio, stream_ms, on_audio_chunk,
+    on_playback_cancel, speak, stop), without a GPU, kokoro, or a
+    turn-taking server."""
 
-    def __init__(self, script=(), echo_reply: np.ndarray | None = None):
+    def __init__(self, script=(), echo_reply: np.ndarray | None = None,
+                 cancel_on_feed: bool = False):
         self.script = [list(s) for s in script]
         self.fed: list[np.ndarray] = []
         self.spoken: list[str] = []
         self.stops = 0
         self.on_audio_chunk = None
+        self.on_playback_cancel = None
         self._t_ms = 0
         # If set, every feed_audio call pushes this back out through the
         # on_audio_chunk hook -- standing in for "the assistant is speaking",
         # without needing a real TTS engine or a second call into speak().
         self.echo_reply = echo_reply
+        # If set, every feed_audio call also fires on_playback_cancel --
+        # standing in for a real VoiceService.stop() firing it, without
+        # needing a real barge-in through the turn-taking policy. Triggered
+        # from inside feed_audio (not called directly by a test) so it runs
+        # on the same event loop that is actually driving the websocket.
+        self.cancel_on_feed = cancel_on_feed
 
     @property
     def stream_ms(self) -> int:
@@ -110,6 +119,8 @@ class FakeAudioVoice:
         self._t_ms += 160
         if self.echo_reply is not None and self.on_audio_chunk is not None:
             await self.on_audio_chunk(self.echo_reply)
+        if self.cancel_on_feed and self.on_playback_cancel is not None:
+            await self.on_playback_cancel()
         return [TurnEvent(state, text, t_ms) for state, text in pairs]
 
     async def speak(self, text, utterance_id):
@@ -191,6 +202,55 @@ def test_audio_ws_installs_and_clears_the_playback_hook(tmp_path):
         assert voice.on_audio_chunk is not None
         ws.send_bytes(np.zeros(CHUNK_SAMPLES, dtype=np.float32).tobytes())
     assert voice.on_audio_chunk is None
+
+
+def test_audio_ws_installs_and_clears_the_playback_cancel_hook(tmp_path):
+    voice = FakeAudioVoice()
+    app, orch = make_app(tmp_path, voice)
+    client = TestClient(app)
+
+    assert voice.on_playback_cancel is None
+    with client.websocket_connect("/audio") as ws:
+        assert voice.on_playback_cancel is not None
+        ws.send_bytes(np.zeros(CHUNK_SAMPLES, dtype=np.float32).tobytes())
+    assert voice.on_playback_cancel is None
+
+
+def test_audio_ws_sends_a_text_control_frame_when_playback_is_cancelled(tmp_path):
+    """The barge-in fix: halting TTS generation server-side does nothing
+    about audio already sent and sitting in the browser's playback queue.
+    The browser needs an explicit, unambiguous signal to stop and discard
+    it -- and since ordinary audio arrives as BINARY frames, that signal
+    must be a differently-typed (text/JSON) frame, never mistakable for a
+    chunk of PCM to play."""
+    voice = FakeAudioVoice(cancel_on_feed=True)
+    app, orch = make_app(tmp_path, voice)
+    client = TestClient(app)
+
+    with client.websocket_connect("/audio") as ws:
+        ws.send_bytes(np.zeros(CHUNK_SAMPLES, dtype=np.float32).tobytes())
+        received = ws.receive_text()
+
+    assert json.loads(received) == {"type": "cancel"}
+
+
+def test_playback_cancel_frame_is_never_mistaken_for_a_binary_audio_frame(tmp_path):
+    """Belt and braces on the same fix: when both synthesized audio AND a
+    cancellation happen to be in flight, the control frame must still be
+    text while the audio stays binary -- a client distinguishing solely on
+    frame type can never confuse the two, regardless of ordering."""
+    reply = np.full(4, 0.25, dtype=np.float32)
+    voice = FakeAudioVoice(echo_reply=reply, cancel_on_feed=True)
+    app, orch = make_app(tmp_path, voice)
+    client = TestClient(app)
+
+    with client.websocket_connect("/audio") as ws:
+        ws.send_bytes(np.zeros(CHUNK_SAMPLES, dtype=np.float32).tobytes())
+        first = ws.receive()
+        second = ws.receive()
+
+    kinds = {("bytes" if "bytes" in m else "text") for m in (first, second)}
+    assert kinds == {"bytes", "text"}
 
 
 def test_audio_ws_logs_connect_and_disconnect(tmp_path):

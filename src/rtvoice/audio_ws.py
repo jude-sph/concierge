@@ -86,8 +86,28 @@ def install_audio_route(app, orch) -> None:
                     # send here take down feed_audio's caller.
                     pass
 
+        async def on_playback_cancel() -> None:
+            # A control message, not audio -- binary frames on this socket
+            # are always raw PCM (see on_audio_chunk above), so the browser
+            # needs an unambiguous, differently-typed frame to know "this is
+            # an instruction, not a sample buffer". A text/JSON frame is the
+            # simplest scheme that can never be confused with a binary one.
+            # Sent through the same send_lock as audio so it can never be
+            # reordered around the very chunks it's telling the browser to
+            # drop.
+            async with send_lock:
+                try:
+                    await ws.send_text('{"type": "cancel"}')
+                except Exception:
+                    # Same reasoning as on_audio_chunk: the browser may
+                    # already be gone, and that's fine -- there's nothing
+                    # left to cancel for it anyway.
+                    pass
+
         previous_hook = orch.voice.on_audio_chunk
+        previous_cancel_hook = orch.voice.on_playback_cancel
         orch.voice.on_audio_chunk = on_audio_chunk
+        orch.voice.on_playback_cancel = on_playback_cancel
         orch.log.append("audio_ws_connected")
         try:
             while True:
@@ -101,4 +121,5 @@ def install_audio_route(app, orch) -> None:
             orch.log.append("audio_ws_error", error=repr(exc), error_type=type(exc).__name__)
         finally:
             orch.voice.on_audio_chunk = previous_hook
+            orch.voice.on_playback_cancel = previous_cancel_hook
             orch.log.append("audio_ws_disconnected")

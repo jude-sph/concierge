@@ -112,6 +112,40 @@ async def test_stop_never_constructs_a_tts(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_stop_fires_the_playback_cancel_hook_when_one_is_attached(tmp_path):
+    """The barge-in fix: halting TTS generation (stopping the underlying
+    engine) only stops chunks not yet produced -- it does nothing about
+    audio already sent and sitting in a browser's playback queue.
+    VoiceService.stop() must also fire on_playback_cancel, the hook whatever
+    is relaying audio live (the /audio websocket) attaches, so that side can
+    tell the browser to actually stop making sound."""
+    voice = VoiceService(tmp_path, tts_factory=FakeTTS)
+    calls = []
+
+    async def hook():
+        calls.append(1)
+
+    voice.on_playback_cancel = hook
+    try:
+        await voice.stop()
+        assert calls == [1]
+    finally:
+        voice.close()
+
+
+@pytest.mark.asyncio
+async def test_stop_without_a_playback_cancel_hook_still_works(tmp_path):
+    """No listener attached (every existing caller before this fix, and every
+    other test in this file) must not raise -- the hook is optional, same
+    pattern as on_audio_chunk."""
+    voice = VoiceService(tmp_path, tts_factory=FakeTTS)
+    try:
+        await voice.stop()  # must not raise
+    finally:
+        voice.close()
+
+
+@pytest.mark.asyncio
 async def test_speak_uses_the_lazily_built_tts_and_records_it(tmp_path):
     voice = VoiceService(tmp_path, tts_factory=FakeTTS)
     try:

@@ -215,6 +215,16 @@ class VoiceService:
         # (every existing caller, every existing test) behaves exactly as
         # before -- this is purely additive.
         self.on_audio_chunk: Optional[Callable[[np.ndarray], Awaitable[None]]] = None
+        # Optional sink fired whenever speech is stopped (barge-in or reset),
+        # set by the same listener that owns on_audio_chunk (the /audio
+        # websocket). Halting generation server-side is not enough on its
+        # own: audio already sent for this utterance is already sitting in
+        # the browser's WebAudio queue and would otherwise keep playing to
+        # completion regardless of what the server does next. This hook is
+        # the server's half of telling the browser "stop and discard
+        # whatever you're playing, right now" -- None by default, so every
+        # existing caller/test that never attaches a listener is unaffected.
+        self.on_playback_cancel: Optional[Callable[[], Awaitable[None]]] = None
 
     # -- text to speech -------------------------------------------------------
     #
@@ -292,6 +302,15 @@ class VoiceService:
         # the thing that constructs a (possibly unavailable) TTS engine.
         if self._tts is not None:
             self._tts.stop()
+        # Tell whatever is playing this back live to discard anything already
+        # queued -- halting generation here only stops chunks not yet sent;
+        # it does nothing about ones already on the wire. Fired unconditionally
+        # (even with no TTS constructed yet, even with nothing currently
+        # speaking): a cheap, idempotent "there is nothing to hear" signal is
+        # harmless, and this is also the single choke point every barge-in and
+        # every reset already routes through.
+        if self.on_playback_cancel is not None:
+            await self.on_playback_cancel()
 
     def close(self) -> None:
         self.recorder.close()
