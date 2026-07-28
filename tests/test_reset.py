@@ -126,3 +126,82 @@ def test_post_reset_endpoint_restores_a_clean_slate(tmp_path):
     assert state["tasks"] == []
     assert state["pending_question"] is None
     assert orch.history == []
+
+
+# --- the microphone buffer -----------------------------------------------
+#
+# It holds the last 30 seconds regardless of what the conversation is doing,
+# and the read mark sits where the previous turn ended. Observed live: a fresh
+# run opened with "Change my work contacts. Can you get me a booking at a
+# Chinese restaurant?" -- the first half said in the PREVIOUS run -- and that
+# whole thing was dispatched to the reasoner as one command.
+
+@pytest.mark.asyncio
+async def test_reset_discards_audio_from_the_previous_run(tmp_path):
+    import numpy as np
+    from rtvoice.voice_service import VoiceService
+
+    state_path = tmp_path / "device_state.json"
+    state_path.write_text(json.dumps(PRISTINE))
+    orch = make_orch(tmp_path, state_path)
+    orch.voice = VoiceService(tmp_path / "session")
+    orch.voice.audio_log.append(np.ones(16000, dtype=np.float32) * 0.3)
+    orch.voice.last_speech_ms = 1234
+
+    await orch.reset()
+
+    assert orch.voice.audio_log.take().size == 0
+    assert orch.voice.last_speech_ms is None
+
+
+@pytest.mark.asyncio
+async def test_reset_clears_the_merge_hold_clock(tmp_path):
+    """Otherwise the first utterance after a reset is measured against a hold
+    that started in the run before it."""
+    state_path = tmp_path / "device_state.json"
+    state_path.write_text(json.dumps(PRISTINE))
+    orch = make_orch(tmp_path, state_path)
+    orch._merge_first_ms = 500
+    orch._in_flight = "something from before"
+
+    await orch.reset()
+
+    assert orch._merge_first_ms is None
+    assert orch._in_flight is None
+
+
+@pytest.mark.asyncio
+async def test_reset_survives_a_voice_service_with_no_microphone(tmp_path):
+    """FakeVoice, POST /inject, and every existing test have no audio_log."""
+    state_path = tmp_path / "device_state.json"
+    state_path.write_text(json.dumps(PRISTINE))
+    orch = make_orch(tmp_path, state_path)
+    await orch.reset()          # must not raise
+
+
+@pytest.mark.asyncio
+async def test_reset_clears_the_planner_own_conversation(tmp_path):
+    """The planner keeps its own history, separate from orchestrator.history.
+
+    Left standing across a reset it plans a fresh run's first utterance
+    against turns from a run that no longer exists. Observed: a vague request
+    came back as the previous session's plan, staged against records nobody
+    had mentioned; and a plain delete request came back as `noop` after a long
+    demo, read against a dozen unrelated earlier turns.
+    """
+    class Planner:
+        def __init__(self):
+            self._history = [{"role": "user", "content": "rename Bao House"}]
+            self.tokens = {}
+
+        async def handle(self, msg):
+            return []
+
+    state_path = tmp_path / "device_state.json"
+    state_path.write_text(json.dumps(PRISTINE))
+    planner = Planner()
+    orch = make_orch(tmp_path, state_path, reasoner=planner)
+
+    await orch.reset()
+
+    assert planner._history == []

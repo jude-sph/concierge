@@ -48,7 +48,13 @@ class Orchestrator:
         use_concierge: bool = True,
         merge_window_ms: int = 1200,
         merge_hold_ms: int = 900,
-        merge_max_hold_ms: int = 12000,
+        # Longer than the longest real command measured on this system: the
+        # six-fragment recording ran 21 seconds of continuous speech. At 12s
+        # this valve fired in the middle of that exact utterance, dispatching
+        # its first clause alone -- reintroducing the split it exists to
+        # prevent. It is a backstop against a room that is never quiet, not a
+        # limit on how long someone may take to finish a sentence.
+        merge_max_hold_ms: int = 25000,
     ) -> None:
         self.reasoner = reasoner
         self.concierge = concierge
@@ -663,6 +669,21 @@ class Orchestrator:
         self._force_dispatched_text = None
         self._merge_parts = []
         self._merge_last_ms = None
+        self._merge_first_ms = None
+        self._in_flight = None
+
+        # The microphone buffer holds the last 30 seconds regardless of what
+        # the conversation is doing, and the read mark sits where the previous
+        # turn ended -- so without this, the first utterance after a reset is
+        # transcribed from a span reaching back BEFORE it. Observed: a fresh
+        # run opened with "Change my work contacts. Can you get me a booking
+        # at a Chinese restaurant?", the first half of which was said in the
+        # previous run, and was then dispatched to the reasoner as one command.
+        audio_log = getattr(self.voice, "audio_log", None)
+        if audio_log is not None:
+            audio_log.reset()
+        if hasattr(self.voice, "last_speech_ms"):
+            self.voice.last_speech_ms = None
 
         # Staged writes awaiting confirmation belong to a run that no longer
         # exists. Neither reasoner exposes a public reset, so these are
@@ -672,6 +693,17 @@ class Orchestrator:
             self.reasoner._pending.clear()
         if hasattr(self.reasoner, "_tokens"):
             self.reasoner._tokens.clear()
+        # The planner keeps its OWN conversation, separate from self.history,
+        # and it is what lets "do the same for Marcus" resolve. Left standing
+        # across a reset it becomes a source of invented work: a fresh run's
+        # first utterance is planned against turns from a run that no longer
+        # exists, and the plainest symptom is a vague request coming back as
+        # the previous session's plan, staged against records nobody in this
+        # conversation has mentioned. It also silently degrades over a long
+        # demo -- a real delete request came back as `noop` because the model
+        # was reading it against a dozen unrelated earlier turns.
+        if hasattr(self.reasoner, "_history"):
+            self.reasoner._history.clear()
 
         self.log.append("reset")
 

@@ -39,14 +39,22 @@ def test_live_ids_excludes_terminal_tasks():
     assert r.live_ids() == ["t1"]
 
 
-def test_fact_block_contains_only_current_state():
+def test_fact_block_says_what_is_underway():
     r = TaskRegistry()
     r.apply(msg("ack", task_id="t1", understood_as="rename contacts"))
     r.apply(msg("progress", task_id="t1", status="scanning"))
     block = r.fact_block()
-    assert "t1" in block
     assert "rename contacts" in block
-    assert "scanning" in block
+    assert "running" in block
+
+
+def test_fact_block_hides_the_internal_task_id():
+    """It is spoken context for a small model, and "t1" is not a word anyone
+    should hear out loud. Nothing cites tasks any more -- the `relay` speech
+    act that needed the id was removed with the rest of that machinery."""
+    r = TaskRegistry()
+    r.apply(msg("ack", task_id="t1", understood_as="rename contacts"))
+    assert "t1" not in r.fact_block()
 
 
 def test_noop_is_ignored():
@@ -132,20 +140,38 @@ def test_failed_stores_reason_verbatim():
     assert r.verbatim_span("t1") == "Cannot delete protected contacts"
 
 
-def test_fact_block_excludes_stale_detail():
-    """fact_block should not include detail from regressed status."""
+def test_fact_block_never_hands_over_wording_to_repeat():
+    """The concierge is told what is happening, never what to say about it.
+
+    This block used to append `exact wording to use: "<detail>"` to every
+    line, written for the `relay` speech act where the concierge reproduced
+    the reasoner's sentence verbatim. Results now reach the person from
+    Orchestrator._speak_facts and never pass through the concierge, so all
+    that instruction could still do was invite a second model to restate the
+    first one's -- and it did, on a destructive write.
+    """
     r = TaskRegistry()
     r.apply(msg("ack", task_id="t1", understood_as="rename contacts"))
-    r.apply(msg("progress", task_id="t1", status="scanning"))
-    block = r.fact_block()
-    assert "scanning" in block
-    assert "running" in block
-
-    # Task completes
     r.apply(msg("done", task_id="t1", result="renamed 47 contacts"))
+
     block = r.fact_block()
-    # Block should contain the done result, not the old scanning status
-    assert "renamed 47 contacts" in block
-    assert "scanning" not in block
-    assert "running" not in block
-    assert "done" in block
+
+    assert "renamed 47 contacts" not in block
+    assert "rename contacts" in block and "done" in block
+
+
+def test_a_pending_confirmation_is_flagged_as_not_to_be_restated():
+    """Measured: the reasoner asked "Delete 1 message from Marcus Webb sent
+    2026-07-27?" and the concierge spoke "Delete messages from Marcus Webb
+    sent yesterday?" -- the COUNT gone, and the person agreeing to something
+    reworded. The verbatim question has already been spoken by then."""
+    r = TaskRegistry()
+    r.apply(msg("ack", task_id="t1", understood_as="delete messages"))
+    r.apply(msg("confirm_required", task_id="t1",
+                question="Delete 1 message from Marcus Webb sent 2026-07-27?"))
+
+    block = r.fact_block()
+
+    assert "Delete 1 message" not in block
+    assert "rephrase" in block.lower() or "again" in block.lower()
+    assert "awaiting_confirm" in block

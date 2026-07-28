@@ -98,17 +98,35 @@ class TaskRegistry:
         return self._verbatim.get(task_id)
 
     def fact_block(self) -> str:
-        """The complete, current, authoritative fact set given to the concierge.
+        """What is underway, for the concierge to talk AROUND — not to recite.
 
         Deliberately contains no history — gaps in stale state are what
         invented task status is made of.
+
+        It used to append `exact wording to use: "<detail>"` to every line.
+        That was written for the `relay` speech act, where the concierge
+        reproduced the reasoner's sentence verbatim; results now reach the
+        person from Orchestrator._speak_facts and never pass through here, so
+        the only thing that instruction could still do was invite a second
+        model to restate the first one's words.
+
+        Which it did, on the case where it matters most. Asked to confirm a
+        delete, the reasoner authored "Delete 1 message from Marcus Webb sent
+        2026-07-27?" and the concierge spoke "Delete messages from Marcus Webb
+        sent yesterday?" -- the count gone, and the person agreeing to
+        something reworded. So the detail text is no longer shown at all: the
+        concierge is told what is happening and never what to say about it.
         """
         if not self._tasks:
             return "No tasks are in progress."
-        lines = ["Current tasks (these are the ONLY task facts you may state):"]
+        lines = ["Underway right now (background, not to be read out):"]
         for t in self._tasks.values():
-            line = f"- [{t.task_id}] {t.understood_as} — status: {t.status.value}"
-            if t.detail:
-                line += f' — exact wording to use: "{t.detail}"'
-            lines.append(line)
+            lines.append(f"- {t.understood_as} — {t.status.value}")
+        if any(t.status is TaskStatus.AWAITING_CONFIRM for t in self._tasks.values()):
+            lines.append(
+                "A confirmation question has ALREADY been asked aloud, word for "
+                "word. Do not ask it again, do not rephrase it, and do not "
+                "describe what it would do -- that wording is the thing the "
+                "person is agreeing to."
+            )
         return "\n".join(lines)

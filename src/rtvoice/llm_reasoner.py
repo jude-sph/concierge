@@ -186,7 +186,10 @@ EXAMPLES (table names and dates below are illustrative, not the real device):
     "understood_as": "look up the most recent message"}]}
   Note: "latest" describes an ORDER, not a value any row holds. Writing
   {"where": {"sent": "latest"}} matches nothing and reports "no messages",
-  which is a false statement about the device.
+  which is a false statement about the device. Note also there is NO "where"
+  at all: the ordering already picks the row out, and adding {"sent": today}
+  on top of it would find nothing on any day the person happened not to be
+  messaged. Only filter when the user actually named something to filter BY.
 
   "read me the last three messages from Marcus" ->
   {"intents": [{"operation": "query", "table": "messages",
