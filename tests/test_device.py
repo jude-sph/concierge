@@ -247,3 +247,69 @@ def test_journal_records_cancelled_update(dev):
     assert cancelled_update is not None, "Cancelled update must be journaled"
     assert cancelled_update["rows"] == 1, "Journal must record how many rows were changed before cancellation"
     assert cancelled_update["cancelled"] is True
+
+
+# --- matching a filter a language model wrote --------------------------------
+#
+# The `where` clause is authored by a model from spoken input, and the stored
+# value is whatever the fixture holds. Live, the planner emitted
+# `where={"id": "11"}` against a row holding `{"id": 11}` and the reasoner
+# reported "no contacts matched" for a contact plainly visible on screen.
+
+def _dev(tmp_path, rows):
+    import json
+    state = tmp_path / "device_state.json"
+    state.write_text(json.dumps({"contacts": rows}))
+    return DeviceState(state, tmp_path / "journal.jsonl")
+
+
+def test_a_number_quoted_as_a_string_still_matches(tmp_path):
+    device = _dev(tmp_path, [{"id": 11, "first_name": "Omar"}])
+    assert [r["first_name"] for r in device.query("contacts", {"id": "11"})] == ["Omar"]
+
+
+def test_a_string_field_queried_as_a_number_still_matches(tmp_path):
+    device = _dev(tmp_path, [{"id": 1, "ext": "204"}])
+    assert len(device.query("contacts", {"ext": 204})) == 1
+
+
+def test_a_name_matches_regardless_of_case_or_spacing(tmp_path):
+    """A difference in case, for a name arriving via speech recognition, is
+    not a difference."""
+    device = _dev(tmp_path, [{"id": 1, "first_name": "Sarah"}])
+    assert len(device.query("contacts", {"first_name": "sarah"})) == 1
+    assert len(device.query("contacts", {"first_name": " Sarah "})) == 1
+
+
+def test_matching_is_still_exact_not_partial(tmp_path):
+    """This predicate also selects the rows `delete` removes. Loosening it to
+    substrings would silently widen the blast radius of every write."""
+    device = _dev(tmp_path, [{"id": 1, "first_name": "Sarah"}])
+    assert device.query("contacts", {"first_name": "Sar"}) == []
+    assert device.query("contacts", {"first_name": "Sarah Chen"}) == []
+
+
+def test_a_boolean_never_matches_a_number(tmp_path):
+    """In Python `True == 1`. Without a guard, `favourite=1` would match a
+    row holding False's sibling values, and `favourite=True` a literal 1."""
+    device = _dev(tmp_path, [{"id": 1, "favourite": True},
+                             {"id": 2, "favourite": 1}])
+    assert [r["id"] for r in device.query("contacts", {"favourite": True})] == [1]
+    assert [r["id"] for r in device.query("contacts", {"favourite": 1})] == [2]
+
+
+def test_a_non_numeric_string_does_not_match_a_number(tmp_path):
+    device = _dev(tmp_path, [{"id": 1, "first_name": "Omar"}])
+    assert device.query("contacts", {"id": "latest"}) == []
+
+
+def test_a_missing_field_matches_nothing(tmp_path):
+    device = _dev(tmp_path, [{"id": 1}])
+    assert device.query("contacts", {"nickname": "Bo"}) == []
+
+
+def test_the_looser_match_reaches_deletes_too(tmp_path):
+    """Deliberate: the same predicate, so what the user was told would be
+    affected is what is actually affected."""
+    device = _dev(tmp_path, [{"id": 11, "first_name": "Omar"}])
+    assert device.delete("contacts", {"id": "11"}) == 1

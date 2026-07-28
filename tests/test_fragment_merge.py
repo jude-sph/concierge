@@ -438,3 +438,117 @@ async def test_the_measured_six_fragment_recording_becomes_one_utterance(tmp_pat
     await driver.run([np.zeros(CHUNK_SAMPLES, dtype=np.float32)] * 150)
 
     assert reasoner.utterances == [" ".join(t for _, t in MEASURED_FRAGMENTS)]
+
+
+# --- holding the window open on our own ears ---------------------------------
+#
+# The window alone was not enough in live use: "almost every command is split
+# in 2, where the second one comes way later". The reason is in SoulX's own
+# source. Every path that emits `speak` calls reset(), clearing its
+# `speech_detected` flag, and the next chunk then re-enters its far-field gate:
+#
+#     if rms(chunk) < far_field_threshold and not speech_detected
+#             and state == "<|user_nonidle|>":
+#         self.reset(); return {"state": "idle"}
+#
+# The start of a phrase is quiet -- that is what the start of a phrase sounds
+# like -- so the continuation is classified `idle`, and the NONIDLE event that
+# would have extended the window never arrives. Whether the person is still
+# talking is therefore measured from the audio directly, not asked of the model
+# that just threw it away.
+
+class ListeningVoice(FakeVoice):
+    """A voice service that can report how long the room has been quiet."""
+
+    def __init__(self, silence_ms=None):
+        super().__init__()
+        self.silence_ms = silence_ms
+
+    def quiet_ms(self, now_ms):
+        return self.silence_ms
+
+
+def make_listening(tmp_path, voice, **kw):
+    state = tmp_path / "device_state.json"
+    state.write_text(json.dumps({"contacts": []}))
+    device = DeviceState(state, tmp_path / "journal.jsonl")
+    reasoner = RecordingReasoner()
+    orch = Orchestrator(
+        reasoner=reasoner, concierge=FakeConcierge(), voice=voice,
+        log=EventLog(tmp_path / "events.jsonl"), device=device, **kw,
+    )
+    return orch, reasoner
+
+
+@pytest.mark.asyncio
+async def test_a_fragment_is_held_while_the_person_is_still_talking(tmp_path):
+    """The window has elapsed, but they have not stopped -- so what is
+    buffered is the first half of something."""
+    voice = ListeningVoice(silence_ms=100)
+    orch, reasoner = make_listening(tmp_path, voice, merge_window_ms=1200,
+                                    merge_hold_ms=900)
+
+    await say(orch, "please change sarah chen", 1000)
+    await orch.on_tick(5000)                   # long past the window
+
+    assert reasoner.utterances == []
+
+
+@pytest.mark.asyncio
+async def test_the_held_fragment_is_dispatched_once_they_stop(tmp_path):
+    """And it arrives merged with the second half, as one command."""
+    voice = ListeningVoice(silence_ms=100)
+    orch, reasoner = make_listening(tmp_path, voice, merge_window_ms=1200,
+                                    merge_hold_ms=900)
+
+    await say(orch, "please change sarah chen", 1000)
+    await orch.on_tick(4000)
+    await say(orch, "to jude", 4200)
+
+    voice.silence_ms = 1000                    # they stopped
+    await orch.on_tick(5600)
+
+    assert reasoner.utterances == ["please change sarah chen to jude"]
+
+
+@pytest.mark.asyncio
+async def test_a_quiet_room_dispatches_on_the_ordinary_window(tmp_path):
+    voice = ListeningVoice(silence_ms=2000)
+    orch, reasoner = make_listening(tmp_path, voice, merge_window_ms=1200,
+                                    merge_hold_ms=900)
+
+    await say(orch, "what is on my calendar", 1000)
+    await orch.on_tick(2300)
+
+    assert reasoner.utterances == ["what is on my calendar"]
+
+
+@pytest.mark.asyncio
+async def test_a_noisy_room_cannot_defer_a_command_forever(tmp_path):
+    """Continuous sound for this long is a room, not a sentence. A command
+    dispatched late is bad; one never dispatched at all is worse."""
+    voice = ListeningVoice(silence_ms=0)       # never quiet
+    orch, reasoner = make_listening(tmp_path, voice, merge_window_ms=1200,
+                                    merge_hold_ms=900, merge_max_hold_ms=8000)
+
+    await say(orch, "delete my messages", 1000)
+    await orch.on_tick(5000)
+    assert reasoner.utterances == []
+
+    await orch.on_tick(9500)
+    assert reasoner.utterances == ["delete my messages"]
+    assert "merge_hold_expired" in kinds(orch)
+
+
+@pytest.mark.asyncio
+async def test_a_voice_service_that_cannot_hear_keeps_the_old_behaviour(tmp_path):
+    """POST /inject and every existing test drive no real audio. "No
+    information" must not read as "still speaking", or nothing would ever be
+    dispatched at all."""
+    orch, reasoner = make_listening(tmp_path, ListeningVoice(silence_ms=None),
+                                    merge_window_ms=1200)
+
+    await say(orch, "what is on my calendar", 1000)
+    await orch.on_tick(2300)
+
+    assert reasoner.utterances == ["what is on my calendar"]

@@ -31,8 +31,54 @@ class DeviceState:
             fh.write(json.dumps(rec) + "\n")
 
     @staticmethod
-    def _matches(row: dict, where: dict | None) -> bool:
-        return where is None or all(row.get(k) == v for k, v in where.items())
+    def _value_matches(actual, expected) -> bool:
+        """Equality across the type sloppiness of a model-authored filter.
+
+        The `where` clause is written by a language model from spoken input,
+        and the stored value is whatever the fixture happens to hold. Two
+        mismatches show up constantly and mean nothing semantically:
+
+          * a number quoted as a string. The planner emitted
+            `where={"id": "11"}` against a row holding `{"id": 11}`, and the
+            reasoner reported "no contacts matched" for a contact plainly
+            visible on screen.
+          * a difference in case or surrounding whitespace, which for a name
+            arriving via speech recognition is not a difference at all.
+
+        This stays EXACT-VALUE matching -- it is deliberately not substring or
+        prefix matching, because this predicate also selects the rows that
+        `delete` removes, and a loosened one would silently widen the blast
+        radius of every destructive write.
+
+        Booleans are compared strictly: in Python `True == 1`, so without this
+        guard a filter of `starred=1` would match `starred=False`'s sibling
+        rows by accident, and `starred=True` would match a literal 1.
+        """
+        if isinstance(actual, bool) or isinstance(expected, bool):
+            return actual is expected
+
+        if actual == expected:
+            return True
+
+        # "11" vs 11, and "3.0" vs 3.
+        if isinstance(actual, (int, float)) and isinstance(expected, str):
+            actual, expected = expected, actual
+        if isinstance(actual, str) and isinstance(expected, (int, float)):
+            try:
+                return float(actual.strip()) == float(expected)
+            except ValueError:
+                return False
+
+        if isinstance(actual, str) and isinstance(expected, str):
+            return actual.strip().casefold() == expected.strip().casefold()
+
+        return False
+
+    @classmethod
+    def _matches(cls, row: dict, where: dict | None) -> bool:
+        if where is None:
+            return True
+        return all(cls._value_matches(row.get(k), v) for k, v in where.items())
 
     def query(self, table: str, where: dict | None = None) -> list[dict]:
         return [copy.deepcopy(r) for r in self._working.get(table, []) if self._matches(r, where)]

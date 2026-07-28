@@ -1144,3 +1144,138 @@ def test_reasoner_env_var_selects_the_llm_reasoner(tmp_path, monkeypatch):
     assert orch.reasoner.model == "some/model"
     # the orchestrator binds its own token registry, as it does for the stub
     assert orch.reasoner.tokens is orch.tokens
+
+
+# --- ordering and limits, for query only -------------------------------------
+#
+# Without these there is no way to say "my latest message", and the planner did
+# the only thing left open to it: it invented a filter value, emitting
+# `where={"sent": "latest"}`. That matches no row, and is then reported as an
+# honest "no messages matched" -- a false statement about the device, and
+# indistinguishable from the user genuinely having no messages.
+
+@pytest.mark.asyncio
+async def test_the_latest_row_is_reachable(tmp_path):
+    reasoner, _ = build(tmp_path, {"intents": [
+        {"operation": "query", "table": "messages",
+         "order_by": "sent", "descending": True, "limit": 1,
+         "understood_as": "look up the most recent message"}]})
+
+    out = await say(reasoner, "what's my latest message?")
+
+    done = [m for m in out if m.kind == "done"][0]
+    assert "sent you the address" in done.result
+
+
+@pytest.mark.asyncio
+async def test_a_limit_takes_that_many_rows(tmp_path):
+    reasoner, _ = build(tmp_path, {"intents": [
+        {"operation": "query", "table": "messages",
+         "order_by": "sent", "descending": True, "limit": 2,
+         "understood_as": "look up the two most recent messages"}]})
+
+    done = [m for m in await say(reasoner, "last two messages") if m.kind == "done"][0]
+    assert "2 messages" in done.result
+
+
+@pytest.mark.asyncio
+async def test_ordering_combines_with_a_filter(tmp_path):
+    reasoner, _ = build(tmp_path, {"intents": [
+        {"operation": "query", "table": "messages",
+         "where": {"contact": "Marcus Webb"},
+         "order_by": "sent", "descending": True, "limit": 1,
+         "understood_as": "look up Marcus's most recent message"}]})
+
+    done = [m for m in await say(reasoner, "latest from marcus") if m.kind == "done"][0]
+    assert "Marcus" in done.result or "deck" in done.result or "late" in done.result
+
+
+@pytest.mark.asyncio
+async def test_the_ordering_is_stated_back_in_the_ack(tmp_path):
+    """What the panel shows must say the query was narrowed, or a one-row
+    answer reads as "you only have one message"."""
+    reasoner, _ = build(tmp_path, {"intents": [
+        {"operation": "query", "table": "messages",
+         "order_by": "sent", "descending": True, "limit": 1,
+         "understood_as": "x"}]})
+
+    ack = [m for m in await say(reasoner, "latest message") if m.kind == "ack"][0]
+    assert "newest by sent" in ack.understood_as and "top 1" in ack.understood_as
+
+
+@pytest.mark.asyncio
+async def test_a_destructive_write_cannot_be_ordered(tmp_path):
+    """`delete ... limit 1` reads as a safe, narrow operation while actually
+    meaning "delete whichever row happened to sort first" -- picked by data
+    the person never saw. Narrowing a write stays the job of `where`, whose
+    blast radius is stated back before anything happens."""
+    reasoner, _ = build(tmp_path, {"intents": [
+        {"operation": "delete", "table": "messages",
+         "order_by": "sent", "descending": True, "limit": 1,
+         "understood_as": "delete the oldest message"}]})
+
+    out = await say(reasoner, "delete my oldest message")
+
+    assert [m.kind for m in out] == ["ack", "failed"]
+    assert ids(reasoner, "messages") == [1, 2, 3, 4, 5]
+
+
+@pytest.mark.asyncio
+async def test_a_destructive_write_cannot_be_limited(tmp_path):
+    reasoner, _ = build(tmp_path, {"intents": [
+        {"operation": "delete", "table": "messages", "limit": 1,
+         "understood_as": "delete one message"}]})
+
+    out = await say(reasoner, "delete a message")
+
+    assert [m.kind for m in out] == ["ack", "failed"]
+    assert ids(reasoner, "messages") == [1, 2, 3, 4, 5]
+
+
+@pytest.mark.asyncio
+async def test_sorting_by_a_field_that_does_not_exist_is_refused(tmp_path):
+    reasoner, _ = build(tmp_path, {"intents": [
+        {"operation": "query", "table": "messages", "order_by": "vibe",
+         "understood_as": "look up messages by vibe"}]})
+
+    out = await say(reasoner, "messages by vibe")
+    assert [m.kind for m in out] == ["ack", "failed"]
+
+
+@pytest.mark.asyncio
+async def test_a_nonsense_limit_is_refused(tmp_path):
+    reasoner, _ = build(tmp_path, {"intents": [
+        {"operation": "query", "table": "messages", "limit": 0,
+         "understood_as": "look up no messages"}]})
+
+    out = await say(reasoner, "show me zero messages")
+    assert [m.kind for m in out] == ["ack", "failed"]
+
+
+@pytest.mark.asyncio
+async def test_an_unordered_query_is_unchanged(tmp_path):
+    reasoner, _ = build(tmp_path, {"intents": [
+        {"operation": "query", "table": "messages",
+         "where": {"contact": "Marcus Webb"},
+         "understood_as": "look up Marcus's messages"}]})
+
+    out = await say(reasoner, "messages from marcus")
+    ack = [m for m in out if m.kind == "ack"][0]
+    assert ack.understood_as == 'look up messages where contact = "Marcus Webb"'
+
+
+@pytest.mark.asyncio
+async def test_a_column_holding_mixed_types_sorts_without_raising(tmp_path):
+    """Rows are model-editable JSON, so one column can end up holding a string
+    in one row and a number in another. A bare sorted() on that raises
+    TypeError mid-request."""
+    state = copy.deepcopy(DEVICE)
+    state["messages"][0]["sent"] = 20260725
+    state["messages"][1]["sent"] = None
+    reasoner, _ = build(tmp_path, {"intents": [
+        {"operation": "query", "table": "messages",
+         "order_by": "sent", "descending": True, "limit": 2,
+         "understood_as": "x"}]}, state=state)
+
+    out = await say(reasoner, "latest messages")
+    assert [m.kind for m in out] == ["ack", "done"]

@@ -71,6 +71,8 @@ is to turn what the user said into a PLAN over the device's tables.
 
 OPERATIONS - the device supports these and nothing else:
   query        read rows from a table. Optional "where" filter. Read-only.
+               May also take "order_by" (a field name), "descending" (true for
+               newest/largest first) and "limit" (how many rows to keep).
   update       change fields on existing rows. "values" is what to set,
                "where" scopes which rows. NO "where" MEANS EVERY ROW.
   delete       remove rows. "where" scopes which rows. NO "where" EMPTIES THE
@@ -86,14 +88,22 @@ OPERATIONS - the device supports these and nothing else:
 RULES:
 - One intent per action, in the order the user said them. A compound request
   ("do X and do Y") is two intents.
-- A question about what the system can do, or whether it can do it -
-  "don't you have access to my calendar?", "can you see my messages?", "do
-  you know my contacts?" - is a question about the SYSTEM, not a lookup of
-  any row. It is "none", never "unsupported" and never a guessed table: the
-  system genuinely can read and change every table below, so there is no
-  honest "unsupported" answer to give, and there is no filter to invent
-  either, because nothing was actually asked to be found. Only an actual
-  request for a fact ("what's on my calendar", "who's Priya") is a "query".
+- A question about what the system can do, or whether it can do it - "what
+  can you do?", "what are you capable of?", "how does this work?", "don't you
+  have access to my calendar?", "can you see my messages?", "do you know my
+  contacts?" - is a question about the SYSTEM, not a lookup of any row. It is
+  "none", never "unsupported" and never a guessed table: the system genuinely
+  can read and change every table below, so there is no honest "unsupported"
+  answer to give, and there is no filter to invent either, because nothing was
+  actually asked to be found. Only an actual request for a fact ("what's on my
+  calendar", "who's Priya") is a "query".
+  This matters more than it looks. A question like this is ANSWERED BY THE
+  CONVERSATION, and it only gets there if you return "none" - anything you
+  return instead is spoken to the person INSTEAD of an answer. Asked "what are
+  you capable of?", a guessed contacts lookup made the system reply "there are
+  11 contacts: Ju, Marcus, Aisha, and 8 more", which answers nothing and is a
+  non sequitur. When a sentence is about YOU rather than about the data,
+  return "none" and let the conversation handle it.
 - Sending a message or making a booking IS an insert into the table that
   records it. Only use "unsupported" when no table could hold the result.
 - "table" must be one of the tables below. Every key in "where" and "values"
@@ -116,9 +126,24 @@ RULES:
   syntax on this device - never invent one. To act on every row in a table,
   OMIT "where" entirely (or use {}); that is the only correct way to mean
   "all of them".
+- A "where" value is always a LITERAL value that could appear in the data. A
+  word like "latest", "recent", "newest", "last" or "any" is NOT such a value
+  and must never be written into a filter - it matches nothing, and the user
+  is then told there are no records when there are. "The latest X" is said
+  with "order_by" + "descending" + "limit", and "order_by"/"limit" work on
+  "query" only. If a superlative is asked for on an update or delete, narrow
+  it with "where" instead, or use "none".
 - NEVER count anything, and never say how many records are affected. You do
   not know, and the system computes it itself from the device.
 - If you cannot tell what was meant, use "none". Do not guess at a write.
+- Earlier turns are there to resolve REFERENCES ("do it for her too", "the
+  same for Marcus"), and for nothing else. A write must name its target and
+  its new value in THIS turn, or inherit them from a turn that plainly
+  continues it. "Please change the contact" on its own names neither which
+  contact nor what to change, so it is "none" - never the previous turn's
+  plan repeated with its old table and old values. Repeating a plan the user
+  did not ask for again is the worst thing you can do: it stages a write
+  against records they were not talking about.
 
 EXAMPLES (table names and dates below are illustrative, not the real device):
 
@@ -155,6 +180,30 @@ EXAMPLES (table names and dates below are illustrative, not the real device):
     "where": {"day": "2026-07-28"},
     "understood_as": "look up tomorrow's calendar"}]}
 
+  "what's my latest message?" ->
+  {"intents": [{"operation": "query", "table": "messages",
+    "order_by": "sent", "descending": true, "limit": 1,
+    "understood_as": "look up the most recent message"}]}
+  Note: "latest" describes an ORDER, not a value any row holds. Writing
+  {"where": {"sent": "latest"}} matches nothing and reports "no messages",
+  which is a false statement about the device.
+
+  "read me the last three messages from Marcus" ->
+  {"intents": [{"operation": "query", "table": "messages",
+    "where": {"contact": "Marcus Webb"},
+    "order_by": "sent", "descending": true, "limit": 3,
+    "understood_as": "look up Marcus's three most recent messages"}]}
+
+  "what are you capable of?" ->
+  {"intents": [{"operation": "none",
+    "understood_as": "asked what the system can do"}]}
+  Note: about the SYSTEM, not about any row. No table, no filter. Returning a
+  contacts query here made the system answer "there are 11 contacts", which is
+  not an answer to the question that was asked.
+
+  "hello" / "thanks, that's great" ->
+  {"intents": [{"operation": "none", "understood_as": "chit-chat"}]}
+
   "don't you have access to my calendar?" ->
   {"intents": [{"operation": "none",
     "understood_as": "asked whether the system can read the calendar"}]}
@@ -188,6 +237,9 @@ examples above:
               "table": "<table or null>",
               "where": {"<field>": "<value>"} or null,
               "values": {"<field>": "<value>"} or null,
+              "order_by": "<field or null>",   // query only
+              "descending": true|false,         // query only
+              "limit": <number or null>,        // query only
               "understood_as": "<short paraphrase of this one action>"}]}
 """
 
@@ -203,6 +255,9 @@ PLAN_SCHEMA = {
                     "table": {"type": ["string", "null"]},
                     "where": {"type": ["object", "null"]},
                     "values": {"type": ["object", "null"]},
+                    "order_by": {"type": ["string", "null"]},
+                    "descending": {"type": "boolean"},
+                    "limit": {"type": ["integer", "null"]},
                     "understood_as": {"type": "string"},
                 },
                 "required": ["operation"],
@@ -222,6 +277,21 @@ class Intent(BaseModel):
     where: Optional[dict[str, Any]] = None
     values: Optional[dict[str, Any]] = None
     understood_as: str = ""
+    # Ordering and truncation, for QUERY ONLY. Without these there is no way
+    # to say "my latest message", and the planner did the only thing left open
+    # to it: it invented a filter value, emitting
+    # `where={"sent": "latest"}` -- which matches no row, and is then reported
+    # as an honest "no messages matched" that is indistinguishable from the
+    # user simply having no messages.
+    #
+    # Deliberately NOT available on update/delete. `delete ... limit 1` reads
+    # as a safe, narrow operation while actually meaning "delete whichever row
+    # happened to sort first", and which row that is depends on data the user
+    # never saw. Narrowing a destructive write stays the job of `where`, whose
+    # blast radius is stated back to the person before anything happens.
+    order_by: Optional[str] = None
+    descending: bool = False
+    limit: Optional[int] = None
 
 
 class Plan(BaseModel):
@@ -300,6 +370,50 @@ def _describe_where(where: dict | None) -> str:
     if not where:
         return "everything"
     return " and ".join(f"{k} = {_fmt(v)}" for k, v in where.items())
+
+
+def _sort_key(value):
+    """Order mixed-typed column values without raising.
+
+    Rows are model-editable JSON, so one column can end up holding a string in
+    one row and a number in another, and a bare `sorted(key=...)` on that
+    raises TypeError mid-request. Missing values sort first (ascending), which
+    puts them last for the "newest" queries this exists to serve.
+    """
+    if value is None:
+        return (0, 0.0, "")
+    if isinstance(value, bool):
+        return (1, float(value), "")
+    if isinstance(value, (int, float)):
+        return (1, float(value), "")
+    return (2, 0.0, str(value))
+
+
+def _ordered(rows: list[dict], order_by: str | None, descending: bool,
+             limit: int | None) -> list[dict]:
+    """Sort and truncate query results.
+
+    ISO-8601 dates and timestamps -- the format every date field on this
+    device uses -- sort correctly as plain strings, which is why this needs no
+    date parsing and cannot misparse one.
+    """
+    if order_by:
+        rows = sorted(rows, key=lambda r: _sort_key(r.get(order_by)),
+                      reverse=descending)
+    if limit is not None and limit > 0:
+        rows = rows[:limit]
+    return rows
+
+
+def _describe_scope(where: dict | None, order_by: str | None,
+                    descending: bool, limit: int | None) -> str:
+    """The `understood_as` tail for a query, in the panel's own shorthand."""
+    parts = [f"where {_describe_where(where)}"]
+    if order_by:
+        parts.append(f"{'newest' if descending else 'oldest'} by {order_by}")
+    if limit:
+        parts.append(f"top {limit}")
+    return ", ".join(parts)
 
 
 # Tables whose name is not itself a countable noun. "calendar" was previously
@@ -883,6 +997,20 @@ class LlmReasoner:
                     return (f"a wildcard can't be used to filter {noun}s -- "
                             "leaving the filter out matches everyone instead")
 
+        if intent.order_by is not None:
+            if intent.operation != "query":
+                # See the note on Intent.order_by: ordering a destructive write
+                # would let "delete the oldest one" pick a row by criteria the
+                # person never saw.
+                return f"I can only sort {noun}s when looking them up."
+            if fields and intent.order_by not in fields:
+                return f"{noun}s aren't sorted by that."
+        if intent.limit is not None:
+            if intent.operation != "query":
+                return f"I can only take the first few {noun}s when looking them up."
+            if not isinstance(intent.limit, int) or intent.limit < 1:
+                return "that's not a number of results I can take."
+
         if intent.operation == "update" and not intent.values:
             return "there's nothing to change."
         if intent.operation == "insert" and not (intent.values or {}):
@@ -932,10 +1060,13 @@ class LlmReasoner:
         if intent.operation == "query":
             # Read-only: no confirmation, and the answer is the device's, row
             # for row. Nothing is staged, so there is nothing to roll back.
-            rows = self.device.query(table, where)
+            rows = _ordered(self.device.query(table, where),
+                            intent.order_by, intent.descending, intent.limit)
+            scope = _describe_scope(where, intent.order_by, intent.descending,
+                                    intent.limit)
             return [
                 ReasonerMessage(kind="ack", task_id=tid,
-                                understood_as=f"look up {table} where {_describe_where(where)}"),
+                                understood_as=f"look up {table} {scope}"),
                 ReasonerMessage(kind="done", task_id=tid,
                                 result=_describe_hits(table, rows)),
             ]

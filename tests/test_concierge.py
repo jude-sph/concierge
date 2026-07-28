@@ -14,7 +14,8 @@ conversational layer can never take down a turn.
 import httpx
 import pytest
 
-from rtvoice.concierge import MAX_REPLY_CHARS, Concierge, clean_reply
+from rtvoice.concierge import (MAX_REPLY_CHARS, Concierge, _phrase_key,
+                               clean_reply)
 from rtvoice.protocol import ReasonerMessage
 from rtvoice.registry import TaskRegistry
 
@@ -162,3 +163,132 @@ async def test_history_is_bounded(monkeypatch):
     spoken = [m for m in post.payloads[0]["messages"] if m["role"] != "system"]
     assert len(spoken) <= 8
     assert spoken[-1]["content"] == "line 49"
+
+
+# --- speaking freely, not reciting ------------------------------------------
+#
+# "the model says I'm onto it for everything which is getting a bit annoying".
+# A small model asked to acknowledge a request converges hard on one phrase and
+# then says it every single turn, which is the most robot-like thing this
+# component does -- in a component that exists to make the exchange feel like a
+# conversation.
+
+def test_the_same_opening_counts_as_a_repeat():
+    """Exact-match would miss it: "I'm onto it." and "I'm onto it right now!"
+    are the same tic, and treating them as different replies is how the tic
+    survives the check."""
+    assert _phrase_key("I'm onto it.") == _phrase_key("I'm onto it right now!")
+    assert _phrase_key("Sure thing.") != _phrase_key("I'm onto it.")
+
+
+class _ScriptedPost(_FakePost):
+    """Returns a different reply per call, so a re-roll can be observed."""
+
+    def __init__(self, *contents):
+        super().__init__(content=None)
+        self.contents = list(contents)
+
+    async def __call__(self, url, json=None, **kw):
+        self.content = self.contents[min(len(self.payloads), len(self.contents) - 1)]
+        return await super().__call__(url, json=json, **kw)
+
+
+@pytest.mark.asyncio
+async def test_a_repeated_reply_is_re_rolled(monkeypatch):
+    """The model, not the fake, has to be the one repeating itself: the
+    re-roll only fires when a generation comes back matching a recent one."""
+    c = Concierge()
+    post = _ScriptedPost("I'm onto it.", "I'm onto it.", "Sure, give me a second.")
+    monkeypatch.setattr(c._client, "post", post)
+
+    assert await c.respond(TaskRegistry(), [], "user_turn") == "I'm onto it."
+    second = await c.respond(TaskRegistry(), [], "user_turn")
+
+    assert second == "Sure, give me a second."
+    assert c.repeats == 1
+    assert len(post.payloads) == 3, "the repeat cost one extra call, no more"
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_reply_costs_no_extra_call(monkeypatch):
+    """Re-rolling unconditionally would double every turn's latency in the one
+    component whose whole job is to answer fast."""
+    c = Concierge()
+    post = _FakePost(content="Sure thing.")
+    monkeypatch.setattr(c._client, "post", post)
+
+    await c.respond(TaskRegistry(), [], "user_turn")
+    post.content = "No problem."
+    await c.respond(TaskRegistry(), [], "user_turn")
+
+    assert len(post.payloads) == 2
+
+
+@pytest.mark.asyncio
+async def test_what_was_already_said_is_shown_to_the_model(monkeypatch):
+    c = Concierge()
+    post = _FakePost(content="I'm onto it.")
+    monkeypatch.setattr(c._client, "post", post)
+    await c.respond(TaskRegistry(), [], "user_turn")
+
+    post.content = "Sure."
+    await c.respond(TaskRegistry(), [], "user_turn")
+
+    assert "I'm onto it." in post.payloads[1]["messages"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_re_roll_keeps_the_repeated_reply(monkeypatch):
+    """Saying the same thing twice is worse than nothing, but not by enough to
+    be worth staying silent over."""
+    c = Concierge()
+    post = _ScriptedPost("On it.", "On it.", "")
+    monkeypatch.setattr(c._client, "post", post)
+
+    await c.respond(TaskRegistry(), [], "user_turn")
+    assert await c.respond(TaskRegistry(), [], "user_turn") == "On it."
+
+
+# --- never reading the briefing aloud ---------------------------------------
+
+@pytest.mark.asyncio
+async def test_state_is_folded_into_a_single_system_message(monkeypatch):
+    """Position was the cause, not wording.
+
+    A separate context message sits immediately before the model's turn, and a
+    small model reproduces the most recent instruction-shaped text it can see:
+    the person heard "Say you are onto it. Do not answer." spoken aloud, and
+    then, after that was reworded to terse state, heard "LOOKING UP: Please
+    change the contact." read out as the reply. So the state now goes at the
+    very start of the one system message, with the whole conversation between
+    it and the point of generation.
+    """
+    c = Concierge()
+    post = _FakePost(content="Let me look.")
+    monkeypatch.setattr(c._client, "post", post)
+
+    await c.respond(TaskRegistry(), [{"role": "user", "content": "hi"}],
+                    "user_turn", in_flight="change the contact")
+
+    messages = post.payloads[0]["messages"]
+    assert sum(m["role"] == "system" for m in messages) == 1
+    assert messages[0]["role"] == "system"
+    assert "change the contact" in messages[0]["content"]
+    assert messages[-1]["role"] == "user"
+
+
+@pytest.mark.parametrize("echo", [
+    "LOOKING UP: Please change the contact.",
+    "TASKS: t1 rename contacts",
+    "CURRENT STATE (never read aloud):",
+    "already said (do not reuse): On it.",
+])
+def test_a_reply_echoing_our_own_labels_is_never_spoken(echo):
+    """Last line of defence. The real fix is positional, but the failure mode
+    is speaking internal bookkeeping AT a person -- observed twice live -- and
+    silence is always a safe reply where this never was."""
+    assert clean_reply(echo) == ""
+
+
+def test_a_sentence_that_merely_mentions_a_task_still_speaks():
+    assert clean_reply("Looking up your calendar now.") == "Looking up your calendar now."

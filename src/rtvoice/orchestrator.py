@@ -47,6 +47,8 @@ class Orchestrator:
         reasoner_timeout_s: float = 20.0,
         use_concierge: bool = True,
         merge_window_ms: int = 1200,
+        merge_hold_ms: int = 900,
+        merge_max_hold_ms: int = 12000,
     ) -> None:
         self.reasoner = reasoner
         self.concierge = concierge
@@ -102,9 +104,35 @@ class Orchestrator:
         # reasoner run in parallel: the concierge still answers immediately, so
         # the user is acknowledged at the same latency as before and only the
         # (already slow, already async) reasoner dispatch moves.
+        #
+        # The window alone was not enough, and the reason is visible in
+        # SoulX's own source. Every path that emits `speak` calls reset(),
+        # which clears its `speech_detected` flag; the very next chunk then
+        # re-enters its far-field gate:
+        #
+        #     if rms(chunk) < far_field_threshold and not speech_detected
+        #             and state == "<|user_nonidle|>":
+        #         self.reset(); return {"state": "idle"}
+        #
+        # An utterance's continuation begins quietly -- that is what the start
+        # of a phrase sounds like -- so it is classified `idle`, and the
+        # NONIDLE that would have extended the window never arrives. The
+        # second half of a split command therefore turns up as an unrelated
+        # new utterance, seconds later.
+        #
+        # So the window is not held open on the upstream model's opinion of
+        # whether the person is still talking. It is held open on ours,
+        # measured from the same audio it discarded (VoiceService.quiet_ms).
+        # `merge_hold_ms` is how much continuous silence has to pass before a
+        # buffered fragment is considered finished, and `merge_max_hold_ms`
+        # bounds the whole thing so a noisy room can never defer a command
+        # indefinitely.
         self.merge_window_ms = merge_window_ms
+        self.merge_hold_ms = merge_hold_ms
+        self.merge_max_hold_ms = merge_max_hold_ms
         self._merge_parts: list[str] = []
         self._merge_last_ms: int | None = None
+        self._merge_first_ms: int | None = None
         # The audio clock's last position, as reported by on_tick. Holding an
         # utterance is only safe when something will later flush it, and
         # on_tick is that something: AudioDriver pumps it after every 160ms
@@ -181,6 +209,8 @@ class Orchestrator:
     def _merge_append(self, text: str, t_ms: int) -> None:
         self._merge_parts.append(text)
         self._merge_last_ms = t_ms
+        if self._merge_first_ms is None:
+            self._merge_first_ms = t_ms
         self.log.append("merge_pending", transcript=text,
                         parts=len(self._merge_parts))
 
@@ -190,6 +220,7 @@ class Orchestrator:
             return None
         parts, self._merge_parts = self._merge_parts, []
         self._merge_last_ms = None
+        self._merge_first_ms = None
         text = " ".join(parts)
         if len(parts) > 1:
             # A distinct event kind so a merge is visible in the session log
@@ -199,9 +230,44 @@ class Orchestrator:
                             count=len(parts))
         return text
 
+    def _still_speaking(self, now_ms: int) -> bool:
+        """Are we hearing them right now, whatever the turn model thinks?
+
+        Deliberately consults the raw microphone level rather than any state
+        the turn-taking model reports: after it finalises a turn it stops
+        detecting speech until something loud enough re-arms it, so precisely
+        when a command has been split in two, its answer to this question is
+        wrong. A VoiceService that cannot answer (`quiet_ms` -> None, meaning
+        no audio has ever arrived, e.g. under POST /inject or in a test with a
+        fake) is treated as "not speaking", which preserves the pure-timer
+        behaviour for every caller that is not driving real audio.
+        """
+        quiet = getattr(self.voice, "quiet_ms", None)
+        if quiet is None:
+            return False
+        silence = quiet(now_ms)
+        return silence is not None and silence < self.merge_hold_ms
+
     def _merge_expired(self, now_ms: int) -> bool:
-        return (self._merge_last_ms is not None
-                and now_ms - self._merge_last_ms >= self.merge_window_ms)
+        if self._merge_last_ms is None:
+            return False
+        if now_ms - self._merge_last_ms < self.merge_window_ms:
+            return False
+        # The window has elapsed, but they have not stopped talking -- so what
+        # is buffered is the first half of something, and dispatching it now
+        # is what produced "it responded that it was starting the task before
+        # I had finished speaking".
+        if self._still_speaking(now_ms):
+            held = (self._merge_first_ms is not None
+                    and now_ms - self._merge_first_ms >= self.merge_max_hold_ms)
+            if not held:
+                return False
+            # Bounded: continuous sound for this long is a room, not a
+            # sentence, and a command that is never dispatched is worse than
+            # one dispatched early.
+            self.log.append("merge_hold_expired",
+                            held_ms=now_ms - self._merge_first_ms)
+        return True
 
     async def _flush_merge_if_expired(self, now_ms: int) -> None:
         if not self._merge_expired(now_ms):
@@ -738,7 +804,27 @@ def build_default_orchestrator(session_dir=None) -> Orchestrator:
         session / "device_journal.jsonl",
     )
     log = EventLog(session / "events.jsonl")
-    voice = VoiceService(session, os.environ.get("SOULX_URL", "ws://localhost:8000/turn"))
+    # Whisper transcribes; SoulX-Duplug only decides when a turn ends (see
+    # asr.py for why). ASR_MODEL="" disables it and falls back to SoulX's own
+    # transcript, which is the previous behaviour -- useful on a machine with
+    # no GPU budget left, and a one-variable way to A/B the difference.
+    asr_model = os.environ.get("ASR_MODEL", "small.en").strip()
+
+    def _build_asr():
+        if not asr_model:
+            return None
+        from .asr import WhisperASR
+        return WhisperASR(
+            asr_model,
+            device=os.environ.get("ASR_DEVICE", "cuda"),
+            compute_type=os.environ.get("ASR_COMPUTE_TYPE", "float16"),
+        )
+
+    voice = VoiceService(
+        session,
+        os.environ.get("SOULX_URL", "ws://localhost:8000/turn"),
+        asr_factory=_build_asr,
+    )
     concierge = Concierge(base_url=os.environ.get("CONCIERGE_URL", "http://localhost:8001/v1"))
     # Off by default: the concierge needs a vLLM server, which the v1 demo
     # does not require. Set USE_CONCIERGE=1 to turn it on once that's running.

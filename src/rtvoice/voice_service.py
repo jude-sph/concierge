@@ -5,14 +5,16 @@ service moves to the Mac and only text crosses the wire.
 """
 from __future__ import annotations
 
+from collections import deque
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
 import numpy as np
 
+from .asr import RollingAudio, transcribe_span
 from .recorder import SessionRecorder
 from .soulx_client import CHUNK_SAMPLES, SAMPLE_RATE, SoulXClient
-from .states import StateAdapter, TurnEvent
+from .states import StateAdapter, TurnEvent, UserState, is_backchannel
 from .tts import OUTPUT_SAMPLE_RATE as TTS_OUTPUT_SAMPLE_RATE
 
 CHUNK_MS = int(CHUNK_SAMPLES / SAMPLE_RATE * 1000)
@@ -185,6 +187,17 @@ class VoiceService:
         # the recorder tags model.wav with has to be known up front. Override
         # this if a `tts_factory` produces audio at some other rate.
         tts_sample_rate: int = TTS_OUTPUT_SAMPLE_RATE,
+        # Built on first use, for the same reason as `tts`: loading a Whisper
+        # model onto a GPU must not be a side effect of constructing a
+        # VoiceService. Left as None (by passing a factory that returns None,
+        # or by leaving `asr` unset in an environment without the package)
+        # every transcript falls back to whatever the turn-taking model said,
+        # which is the previous behaviour exactly.
+        asr_factory: Callable[[], object] | None = None,
+        # Above this per-chunk RMS the person is taken to be talking. Well
+        # under the upstream far-field threshold on purpose: the whole point
+        # is to hear the quiet speech that gets gated out up there.
+        speech_floor_rms: float = 0.008,
     ):
         self.client = SoulXClient(soulx_url)
         self.adapter = StateAdapter()
@@ -195,6 +208,34 @@ class VoiceService:
         self._tts = None
         self._tts_factory = tts_factory
         self._t_ms = 0
+        # --- speech recognition -----------------------------------------------
+        #
+        # SoulX-Duplug ships a transcript alongside its turn state, and using
+        # it is what produced "toju" for "to Jude" and "s." for "Yes." -- a
+        # Chinese-first ASR, reading a buffer whose first 160-320ms its own
+        # far-field gate had already discarded. See asr.py for the full
+        # diagnosis. Its TURN decisions are kept and its words are replaced.
+        self._asr = None
+        self._asr_factory = asr_factory
+        self._asr_ready = asr_factory is None  # nothing to build if unset
+        self.audio_log = RollingAudio(seconds=30.0, sample_rate=SAMPLE_RATE)
+        # Recent (turn-taking model's text, what was actually said) pairs, for
+        # after-the-fact inspection of a session. Bounded; purely diagnostic.
+        self.asr_swaps: deque[tuple[str, str]] = deque(maxlen=20)
+        self.asr_failures = 0
+        # --- our own ears -----------------------------------------------------
+        #
+        # Position on the audio clock of the last chunk that sounded like
+        # someone talking, measured HERE rather than taken from the turn-taking
+        # model. That model resets its speech flag every time it finalises a
+        # turn, after which a quiet continuation trips its far-field gate and
+        # is reported as `idle` -- so its account of "is the person still
+        # speaking" is exactly wrong in the case that matters, when a command
+        # was split and the second half is on its way. This is the audio it
+        # discarded, and it is what holds the merge window open (see
+        # Orchestrator._merge_expired).
+        self.speech_floor_rms = speech_floor_rms
+        self.last_speech_ms: int | None = None
         self.agc = agc
         # `agc_target_rms` predates the switch to peak-targeted gain (see
         # AutoGainControl's docstring for why RMS turned out to be the wrong
@@ -274,6 +315,77 @@ class VoiceService:
         """
         return self._t_ms
 
+    # -- speech recognition ---------------------------------------------------
+
+    @property
+    def asr(self):
+        if not self._asr_ready:
+            self._asr = self._asr_factory()
+            self._asr_ready = True
+        return self._asr
+
+    @asr.setter
+    def asr(self, value) -> None:
+        self._asr = value
+        self._asr_ready = True
+
+    async def _retranscribe(self, events: list[TurnEvent]) -> list[TurnEvent]:
+        """Replace SoulX's words with Whisper's, on our own audio.
+
+        Two kinds of event carry a transcript that this system acts on, and
+        they need different treatment of the read mark:
+
+        * COMPLETE / BACKCHANNEL are finalisations. The span they cover is
+          over, so the mark advances past it -- unconditionally, even if the
+          transcription came back empty, because the mark tracks turn
+          boundaries and re-offering a failed span as part of the NEXT
+          utterance would splice two turns together.
+        * INCOMPLETE is a pause, not an ending. The orchestrator holds it and
+          force-dispatches it only if the turn never completes (the silence
+          timeout), so it needs good words too -- but the person may simply be
+          mid-sentence, so the mark must NOT move or the rest of the utterance
+          would be transcribed without its beginning.
+
+        The state is re-derived from the new text rather than carried over:
+        "Yes." is a backchannel and SoulX's "s." is not, and it is the
+        backchannel classification that lets a one-word confirmation answer a
+        pending destructive write.
+        """
+        if self.asr is None or not events:
+            return events
+
+        out: list[TurnEvent] = []
+        for ev in events:
+            if ev.state in (UserState.COMPLETE, UserState.BACKCHANNEL):
+                audio = self.audio_log.take()
+            elif ev.state is UserState.INCOMPLETE:
+                audio = self.audio_log.peek()
+                # A pause this short cannot contain a dispatchable utterance;
+                # not worth a GPU call on every gap between words.
+                if len(audio) < SAMPLE_RATE * 0.4:
+                    out.append(ev)
+                    continue
+            else:
+                out.append(ev)
+                continue
+
+            try:
+                text = await transcribe_span(self.asr, audio, SAMPLE_RATE)
+            except Exception:
+                # Never let recognition take down the audio path: a turn with
+                # the upstream model's (poor) words still beats no turn.
+                self.asr_failures += 1
+                out.append(ev)
+                continue
+
+            self.asr_swaps.append((ev.transcript, text))
+            state = ev.state
+            if state in (UserState.COMPLETE, UserState.BACKCHANNEL):
+                state = (UserState.BACKCHANNEL if is_backchannel(text)
+                         else UserState.COMPLETE)
+            out.append(TurnEvent(state, text, ev.t_ms))
+        return out
+
     async def feed_audio(self, chunk: np.ndarray) -> list[TurnEvent]:
         if self._agc is not None:
             chunk = self._agc.apply(chunk)
@@ -286,10 +398,33 @@ class VoiceService:
         # AGC), so a replay of a session reproduces what the model saw --
         # hence this runs on `chunk` only after AGC has (maybe) replaced it.
         self.recorder.write_user(chunk)
+        # Kept BEFORE the upstream call, so the audio a turn event refers to is
+        # already buffered by the time that event comes back and is asked to
+        # be transcribed. This is the copy that still has the utterance's
+        # onset in it -- the thing SoulX's far-field gate throws away.
+        self.audio_log.append(chunk)
+        if self.last_agc_input_rms >= self.speech_floor_rms:
+            # The END of this chunk: the speech in it runs right up to there,
+            # so that is the last moment we can say we heard anyone. Stamping
+            # the start instead makes `quiet_ms` report a chunk of silence
+            # that has not happened yet.
+            self.last_speech_ms = self._t_ms + CHUNK_MS
         wire = await self.client.feed(chunk)
         events = self.adapter.feed(wire, self._t_ms)
         self._t_ms += CHUNK_MS
-        return events
+        return await self._retranscribe(events)
+
+    def quiet_ms(self, now_ms: int) -> Optional[int]:
+        """How long since we last heard the person, or None if never.
+
+        `None` means no speech-like audio has arrived at all this session, and
+        callers must treat that as "no information" rather than "silent
+        forever" -- at startup it would otherwise read as an infinitely long
+        silence and defeat every timer that consults it.
+        """
+        if self.last_speech_ms is None:
+            return None
+        return max(0, now_ms - self.last_speech_ms)
 
     async def speak(self, text: str, utterance_id: str) -> None:
         async for chunk in self.tts.stream(text):
