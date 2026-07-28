@@ -70,7 +70,30 @@
     flex: 0 0 auto; display: flex; align-items: center; gap: 10px;
   }
 
-  .sidebar { display: flex; flex-direction: column; gap: 18px; min-height: 0; }
+  /* CSS Grid, not flex: this column previously used a flex column with
+     flex-basis:auto on both children. That algorithm computes each child's
+     "hypothetical size" from its own content, then -- when the total
+     exceeds the available height -- shrinks BOTH children by the same
+     *relative* fraction (flex-shrink is proportional to flex-basis, so with
+     equal shrink factors every item loses the same percentage of its own
+     basis). The phone-data table's content-based height is enormous
+     compared to the task list's, so both panels got shrunk by the same
+     large percentage -- and applied to the small task panel's modest
+     basis, that percentage crushed it down to a ~40px sliver (just the
+     header). A max-height ceiling on the task panel (the previous attempt)
+     does nothing for this: the problem was never that it grew too tall,
+     it was that the shrink math crushed it regardless of any cap.
+     Grid tracks don't have that failure mode: each row is sized from its
+     own content independently, then the 1fr row absorbs whatever is left
+     (floored at 0, so it scrolls internally instead of stealing space from
+     the other row). fit-content(60%) lets the task row size to its actual
+     content (no void when empty/small) while still capping it so a long
+     task list can't push the phone-data panel away. */
+  .sidebar {
+    display: grid;
+    grid-template-rows: fit-content(60%) minmax(120px, 1fr);
+    gap: 18px; min-height: 0;
+  }
 
   /* ---------- conversation: the spine ---------- */
 
@@ -94,12 +117,12 @@
   .empty { color: var(--fg-faint); font-style: italic; padding: 6px 20px 20px; }
 
   /* ---------- tasks: what it's doing ----------
-     Sized to its own content (flex-grow: 0) rather than a fixed split with
-     the phone-data panel below; a generous max-height is only a ceiling for
-     when several tasks are live at once, not the everyday size. The
-     phone-data panel (flex: 1 1 auto) absorbs whatever height is left over. */
+     .tasks-panel is a grid row (see .sidebar above), sized to its own
+     content up to fit-content(60%). min-height is an explicit floor --
+     belt-and-braces against the row track shrinking away -- so the card
+     with the confirmation prompt can never be reduced to a sliver. */
 
-  .tasks-panel { flex: 0 1 auto; max-height: 78%; }
+  .tasks-panel { min-height: 140px; }
   .tasks-body { flex: 1 1 auto; overflow-y: auto; padding: 4px 16px 16px; min-height: 0; }
 
   .task-card {
@@ -141,7 +164,10 @@
 
   /* ---------- device data: the payoff ---------- */
 
-  .device-panel { flex: 1 1 auto; }
+  /* .device-panel is the sidebar's second grid row (minmax(120px, 1fr)):
+     it takes whatever height the task panel didn't use and scrolls
+     internally (.device-body) if its own content is taller than that. */
+  .device-panel { min-height: 0; }
   .device-body { flex: 1 1 auto; overflow-y: auto; padding: 4px 20px 20px; min-height: 0; }
 
   .device-table { margin-bottom: 20px; }
