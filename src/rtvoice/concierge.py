@@ -74,12 +74,37 @@ object, never output on their own:
 # prose, and is left to raise - only true bare-text replies are salvaged.
 _BARE_REPLY_MAX_CHARS = 200
 
+# A live session produced a body with NO brace/bracket punctuation that still
+# was not prose: a pseudo-JSON serialization of the speech act itself --
+# act="relay", cites="t3", text="...verbatim internals...". The brace/bracket
+# check above let it straight through, and it was spoken aloud verbatim,
+# internals and all. This is the second, narrower net: any of the schema's
+# own field names used as a key (quoted or not, "=" or ":" as the separator),
+# or the general shape of a serialized key="value" pair regardless of field
+# name, marks `text` as structured data rather than a sentence a person
+# would say. When in doubt here, the reply is NOT salvaged -- it is left to
+# raise, exactly like broken JSON -- because silence is far better than
+# reading internals aloud.
+_SPEECH_ACT_FIELD_RE = re.compile(
+    r"""["']?\b(act|cites|text|kind|task_id|understood_as)\b["']?\s*[:=]""",
+    re.IGNORECASE,
+)
+_KEY_VALUE_RE = re.compile(r"""[A-Za-z_]\w*\s*=\s*["']""")
+
+
+def _looks_like_structured_data(text: str) -> bool:
+    """True if `text` reads as serialized fields rather than a sentence a
+    person would actually say."""
+    return bool(_SPEECH_ACT_FIELD_RE.search(text) or _KEY_VALUE_RE.search(text))
+
 
 def _looks_like_bare_reply(text: str) -> bool:
     text = text.strip()
     if not text or len(text) > _BARE_REPLY_MAX_CHARS:
         return False
-    return "{" not in text and "[" not in text
+    if "{" in text or "[" in text:
+        return False
+    return not _looks_like_structured_data(text)
 
 
 # A reply that is nothing but an unfilled template slot - the model copying

@@ -177,6 +177,38 @@ async def test_bare_text_reply_can_never_become_a_relay():
 
 
 @pytest.mark.asyncio
+async def test_pseudo_json_speech_act_is_never_salvaged_and_spoken_verbatim():
+    """The CRITICAL live-session failure: the model emitted a pseudo-JSON
+    serialization of the speech act itself, with no brace/bracket
+    punctuation at all, so the old bare-reply check let it straight through
+    and it was spoken aloud verbatim, internals and all:
+
+        act="relay", cites="t3", text="This will rename Sarah to Michael. \
+1 contact. Confirm?"
+
+    This must never be salvaged into a spoken act -- it must be treated
+    exactly like broken JSON (raise, not swallow), so it can never reach the
+    speaker."""
+    content = ('act="relay", cites="t3", text="This will rename Sarah to '
+               'Michael. 1 contact. Confirm?"')
+    c = _concierge_replying(content)
+    with pytest.raises(json.JSONDecodeError):
+        await c.respond(TaskRegistry(), [], trigger="user_turn")
+
+
+@pytest.mark.asyncio
+async def test_a_genuine_bare_sentence_still_salvages():
+    """The fix for the pseudo-JSON case above must not make the salvage path
+    itself useless: an ordinary bare spoken sentence -- the original failure
+    this fallback exists for -- must still be salvaged into a safe chat act,
+    not lost to a JSONDecodeError."""
+    c = _concierge_replying("Sure, I can help with that.")
+    act = await c.respond(TaskRegistry(), [], trigger="user_turn")
+    assert act.act == "chat"
+    assert act.text == "Sure, I can help with that."
+
+
+@pytest.mark.asyncio
 async def test_malformed_json_is_not_swallowed_as_if_it_were_prose():
     """Truncated/garbled JSON (still containing brace punctuation) is a
     different failure from bare spoken text and must not be salvaged -- only
