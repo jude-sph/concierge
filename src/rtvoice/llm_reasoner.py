@@ -414,6 +414,11 @@ def _row_summary(row: dict) -> str:
     """One row, read as a short spoken clause: field names in words ("cuisine
     chinese"), not a silent positional dump ("chinese") that only makes sense
     if you already know the column order.
+
+    Used for update/delete/insert results, which are framed by their own
+    sentence ("added to messages: ...") that this clause slots into. Query
+    results use `_row_sentence` below instead -- a query is not framed by any
+    surrounding sentence of its own, so the row itself has to read as one.
     """
     fields = _speakable_fields(row)
     return ", ".join(f"{k} {_spoken(v)}" for k, v in fields.items())
@@ -432,17 +437,99 @@ def _row_headline(row: dict) -> str:
     return _spoken(next(iter(fields.values())))
 
 
+# Fields that read as a predicate ("rated 4.5") rather than a bare adjective
+# or a prepositional clause. Anything not listed here, and not in
+# _FIELD_PREPOSITIONS, falls back to a plain "key value" clause in
+# _row_sentence -- flatter, but never a silent positional dump.
+_PREDICATE_FIELDS = {"rating": "rated"}
+
+
+def _row_sentence(table: str, row: dict) -> str:
+    """One row, read as a full spoken SENTENCE naming it -- "Golden Lotus is
+    a chinese place in Soho, rated 4.5." -- never a field-by-field dump
+    ("name Golden Lotus, cuisine chinese, area Soho, rating 4.5") that only
+    makes sense read off a table. This is the single-match rendering for a
+    query result; `_row_summary` above (a bare clause, not a sentence) is for
+    update/delete/insert, which already state their own sentence around it.
+
+    The row's first speakable field is treated as its subject (a name or
+    title); everything else becomes either a short adjective, a
+    prepositional clause (reusing the same _FIELD_PREPOSITIONS table
+    `_scope_phrase` uses, so "in Soho"/"from Marcus" read the same way here
+    as they do in a confirmation), or a predicate clause, so the description
+    is always a sentence and never a bare list of "key value" pairs.
+    """
+    fields = _speakable_fields(row)
+    if not fields:
+        return f"a {_noun(table, 1)} with nothing recorded."
+
+    items = list(fields.items())
+    # "first_name" + "last_name" are one identity, not two facts -- kept as
+    # a single subject ("Sarah Chen") rather than turning the surname into a
+    # nonsensical adjective ("a Chen contact").
+    if len(items) >= 2 and items[0][0] == "first_name" and items[1][0] == "last_name":
+        subject = f"{_spoken(items[0][1])} {_spoken(items[1][1])}"
+        rest = items[2:]
+    else:
+        subject = _spoken(items[0][1])
+        rest = items[1:]
+
+    if not rest:
+        return f"{subject}."
+
+    adjectives: list[str] = []
+    clauses: list[str] = []
+    predicates: list[str] = []
+    for key, value in rest:
+        sv = _spoken(value)
+        if key in _PREDICATE_FIELDS:
+            predicates.append(f"{_PREDICATE_FIELDS[key]} {sv}")
+        elif key in _FIELD_PREPOSITIONS:
+            clauses.append(f"{_FIELD_PREPOSITIONS[key]} {sv}")
+        elif isinstance(value, bool):
+            # A true boolean not otherwise named -- state it as a flag.
+            predicates.append(key.replace("_", " "))
+        elif (isinstance(value, str) and len(value) <= 20
+              and "@" not in value and not any(c.isdigit() for c in value)):
+            # Short, plain words ("chinese", "work") read naturally as a
+            # bare adjective right in front of the noun.
+            adjectives.append(sv)
+        else:
+            # Anything identifier-shaped (a phone number, an email, a long
+            # free-text field) does not read as an adjective -- state it as
+            # its own named clause instead.
+            predicates.append(f"{key.replace('_', ' ')} {sv}")
+
+    prefix = " ".join(adjectives) + " " if adjectives else ""
+    sentence = f"{subject} is a {prefix}{_noun(table, 1)}"
+    if clauses:
+        sentence += " " + " ".join(clauses)
+    if predicates:
+        sentence += ", " + " and ".join(predicates)
+    return sentence + "."
+
+
 def _describe_hits(table: str, rows: list[dict]) -> str:
+    """The query result, read as something a person would actually say --
+    never the SQL-shaped "found N match in <table>: field, field, field" a
+    live session produced. Zero rows says so plainly; one row is rendered as
+    a full sentence about that row; several rows are named (the first few,
+    by headline) plus an exact count -- never every field of every row.
+    """
     n = len(rows)
+    noun = _noun(table, n)
     if n == 0:
-        return f"no matches in {table}"
-    word = "match" if n == 1 else "matches"
+        return f"no {noun} matched."
     if n == 1:
-        # A single hit is short enough to say in full.
-        return f"{n} {word} in {table}: {_row_summary(rows[0])}"
+        return _row_sentence(table, rows[0])
     head = ", ".join(_row_headline(r) for r in rows[:3])
     more = f", and {n - 3} more" if n > 3 else ""
-    return f"{n} {word} in {table}: {head}{more}"
+    # "there are N <noun>" is the same idiom _scope_phrase already uses for a
+    # write's blast radius ("all N contacts") -- a real sentence, and one
+    # that reads correctly for every table name this device has, including
+    # "calendar" (see _noun's docstring: it is deliberately left unchanged
+    # for both one entry and many).
+    return f"there are {n} {noun}: {head}{more}."
 
 
 def _date_block(today: dt.date) -> str:
@@ -757,7 +844,7 @@ class LlmReasoner:
                 ReasonerMessage(kind="ack", task_id=tid,
                                 understood_as=f"look up {table} where {_describe_where(where)}"),
                 ReasonerMessage(kind="done", task_id=tid,
-                                result=f"found {_describe_hits(table, rows)}"),
+                                result=_describe_hits(table, rows)),
             ]
 
         if intent.operation == "insert":

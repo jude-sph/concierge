@@ -261,7 +261,7 @@ async def test_read_only_query_completes_without_confirmation(tmp_path):
     result = only(out, "done").result
     # the answer is the device's rows, not the model's prose, and the filter
     # genuinely excludes something
-    assert "2 matches in calendar" in result
+    assert "there are 2 calendar" in result
     assert "standup" in result and "dentist" in result
     assert "cinema" not in result
 
@@ -275,18 +275,19 @@ async def test_scoped_search_over_places(tmp_path):
     }))
     out = await say(reasoner, "find all the chinese restaurants in soho")
     result = only(out, "done").result
-    assert "2 matches in places" in result
+    assert "there are 2 places" in result
     assert "Golden Lotus" in result and "Jade Garden" in result
     assert "Red Lantern" not in result  # chinese, but not in Soho
 
 
 @pytest.mark.asyncio
 async def test_a_single_match_reads_as_a_sentence_not_a_record_dump(tmp_path):
-    """The live-session failure: 'found 1 match in places: Golden Lotus
-    chinese Soho 4.5 False' is a raw row dump read aloud, and the trailing
-    'False' is the saved flag. A person must hear field names, not a
-    positional list of values, and a false boolean -- meaningless spoken --
-    must not be said at all. The internal id must never be spoken either."""
+    """The live-session failure: 'found 1 match in places: name Golden Lotus,
+    cuisine chinese, area Soho, rating 4.5' is a raw field-by-field dump read
+    aloud -- SQL-shaped, not speech. It must instead read as an actual
+    sentence: 'Golden Lotus is a chinese place in Soho, rated 4.5.' The
+    internal id and a false boolean (the "saved" flag) must not be spoken at
+    all."""
     reasoner, _ = build(tmp_path, plan({
         "operation": "query", "table": "places",
         "where": {"name": "Golden Lotus"},
@@ -296,14 +297,13 @@ async def test_a_single_match_reads_as_a_sentence_not_a_record_dump(tmp_path):
     out = await say(reasoner, 'what type of cuisine is golden lotus')
     result = only(out, "done").result
 
-    assert "1 match in places" in result
-    # fields are named in words, not silently concatenated
-    assert "cuisine chinese" in result
-    assert "area Soho" in result
-    assert "rating 4.5" in result
+    assert result == "Golden Lotus is a chinese place in Soho, rated 4.5."
+    # no SQL-shaped "found N match in <table>:" framing, no field-listing
+    assert "found" not in result and "match" not in result
+    assert "cuisine" not in result and "area" not in result and "rating" not in result
     # the internal id and the false "saved" flag carry nothing spoken aloud
     assert "id" not in result
-    assert "False" not in result and "false" not in result
+    assert "False" not in result and "false" not in result and "saved" not in result
 
 
 @pytest.mark.asyncio
@@ -647,7 +647,7 @@ async def test_the_model_cannot_state_a_fact_the_user_hears(tmp_path):
     text = " ".join(m.result + m.verbatim_text + m.reason for m in out)
     assert "40 meetings" not in text
     assert "already deleted" not in text
-    assert "2 matches in calendar" in text
+    assert "there are 2 calendar" in text
 
 
 # --- SAFETY: bad model output mutates nothing --------------------------------
@@ -773,7 +773,7 @@ async def test_prose_wrapped_json_is_parsed_and_executed(tmp_path):
     out = await say(reasoner, "what's in my calendar tomorrow")
 
     assert kinds(out) == ["ack", "done"]
-    assert "2 matches in calendar" in only(out, "done").result
+    assert "there are 2 calendar" in only(out, "done").result
     assert len(fake.calls) == 1  # parsed clean the first time -- no retry needed
 
 
@@ -790,7 +790,7 @@ async def test_bad_json_then_valid_json_retries_once_and_executes(tmp_path):
     retry_messages = fake.calls[1]["messages"]
     assert "could not be read as a plan" in retry_messages[-1]["content"]
     assert kinds(out) == ["ack", "done"]
-    assert "2 matches in calendar" in only(out, "done").result
+    assert "there are 2 calendar" in only(out, "done").result
 
 
 @pytest.mark.asyncio
@@ -817,7 +817,7 @@ async def test_a_bad_intent_does_not_kill_its_siblings(tmp_path):
     out = await say(reasoner, "do the impossible and check my calendar")
     assert kinds(out) == ["ack", "failed", "ack", "done"]
     assert only(out, "failed").reason == "there's no nowhere on this device"
-    assert "2 matches in calendar" in only(out, "done").result
+    assert "there are 2 calendar" in only(out, "done").result
     assert reasoner.misreads == 1
 
 
