@@ -857,7 +857,25 @@ def build_default_orchestrator(session_dir=None) -> Orchestrator:
         os.environ.get("SOULX_URL", "ws://localhost:8000/turn"),
         asr_factory=_build_asr,
     )
-    concierge = Concierge(base_url=os.environ.get("CONCIERGE_URL", "http://localhost:8001/v1"))
+    # The concierge and the reasoner are configured SEPARATELY, and are meant
+    # to be. They ran against one endpoint serving one model behind one mutex,
+    # which made them strictly serial: measured on the demo machine, the
+    # concierge answered in 0.26s alone but 2.11s when fired alongside the
+    # reasoner, because it queued behind a 1.8s planning call. It does that on
+    # every turn -- so the conversational layer, whose entire purpose is to
+    # answer at conversational latency while slower work proceeds, was in
+    # practice the slowest thing in the system, and the parallelism this whole
+    # design rests on was not happening at all.
+    #
+    # CONCIERGE_MODEL is read here because it previously was not: the launch
+    # script set it and nothing consumed it, so the model name silently stayed
+    # at this default. That was harmless only because the local shim ignores
+    # the field; pointed at any real OpenAI-compatible server (Ollama on the
+    # laptop, vLLM) the wrong name is a hard error.
+    concierge = Concierge(
+        base_url=os.environ.get("CONCIERGE_URL", "http://localhost:8001/v1"),
+        model=os.environ.get("CONCIERGE_MODEL", "Qwen/Qwen2.5-3B-Instruct"),
+    )
     # Off by default: the concierge needs a vLLM server, which the v1 demo
     # does not require. Set USE_CONCIERGE=1 to turn it on once that's running.
     use_concierge = os.environ.get("USE_CONCIERGE", "0").strip().lower() in ("1", "true", "yes")
