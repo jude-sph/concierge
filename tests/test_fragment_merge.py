@@ -552,3 +552,43 @@ async def test_a_voice_service_that_cannot_hear_keeps_the_old_behaviour(tmp_path
     await orch.on_tick(2300)
 
     assert reasoner.utterances == ["what is on my calendar"]
+
+
+def test_the_hold_is_one_value_not_a_per_utterance_guess():
+    """It used to be chosen per utterance -- patient when the turn-taking
+    model had emitted `user_incomplete` during it, fast when it had not.
+
+    Measured over 139 utterances, that signal does not predict what it was
+    being used to predict: an utterance the model had hesitated over was
+    followed within 5s 38% of the time, against 42% for one it finalised
+    cleanly. With ~60 per group that difference is inside the noise, and the
+    direction is backwards. It was choosing between 700ms and 2500ms at
+    random, so it is gone.
+    """
+    import inspect
+    from rtvoice.orchestrator import Orchestrator
+
+    params = inspect.signature(Orchestrator.__init__).parameters
+    assert "merge_hold_fast_ms" not in params
+    assert not hasattr(Orchestrator, "_hold_ms")
+
+
+@pytest.mark.asyncio
+async def test_the_hold_sits_at_the_measured_knee(tmp_path):
+    """Swept against six one-command recordings: 1000ms split 3 of them,
+    1500ms split 1, 2000ms split none, and above that only added delay."""
+    from rtvoice.orchestrator import Orchestrator
+    import inspect
+
+    default = inspect.signature(Orchestrator.__init__).parameters["merge_hold_ms"].default
+    assert default == 2000
+
+    voice = ListeningVoice(silence_ms=default - 100)
+    orch, reasoner = make_listening(tmp_path, voice, merge_window_ms=1200)
+    await say(orch, "book me a table for four", 1000)
+    await orch.on_tick(4000)
+    assert reasoner.utterances == [], "still within the hold"
+
+    voice.silence_ms = default + 100
+    await orch.on_tick(4200)
+    assert reasoner.utterances == ["book me a table for four"]
