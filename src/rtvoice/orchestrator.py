@@ -554,6 +554,48 @@ class Orchestrator:
         msg = OrchestratorMessage(kind="cancel", task_id=task_id, seq=self._next_seq())
         asyncio.create_task(self.reasoner.handle(msg))
 
+    async def reset(self) -> None:
+        """Restore a clean slate so the owner can re-run the demo repeatedly:
+        device data back to the pristine fixture, every task cleared,
+        conversation history cleared (this in-memory list AND, via the
+        "reset" event below, the UI transcript), and any pending
+        confirmation cleared.
+
+        Deliberately does NOT touch self.log: that is the session's event
+        log, the recording of what happened, and it survives a reset (this
+        method's own "reset" append becomes one more entry in it, not a
+        truncation). Deliberately does NOT replace self.device with a new
+        DeviceState either -- DeviceState.reload() re-reads its state file
+        in place, so the reasoner (which holds its own `self.device`
+        reference, bound once at construction) keeps seeing fresh data
+        without needing to be rewired.
+        """
+        await self.voice.stop()
+        self._speech_gen += 1  # any in-flight reply from before the reset is stale
+
+        self.device.reload()
+        self.registry = TaskRegistry()
+        self.history = []
+        self.tokens.clear()  # shared by reference with the reasoner; clear, don't rebind
+        self._pending_questions = {}
+        self.policy_state = PolicyState()
+        self._pending_partial = None
+        self._pending_since_ms = None
+        self._force_dispatched_text = None
+        self._merge_parts = []
+        self._merge_last_ms = None
+
+        # Staged writes awaiting confirmation belong to a run that no longer
+        # exists. Neither reasoner exposes a public reset, so these are
+        # cleared directly -- both attributes are simple dicts private to
+        # each reasoner's own bookkeeping, not part of the shared protocol.
+        if hasattr(self.reasoner, "_pending"):
+            self.reasoner._pending.clear()
+        if hasattr(self.reasoner, "_tokens"):
+            self.reasoner._tokens.clear()
+
+        self.log.append("reset")
+
 
 class Inject(BaseModel):
     """Request body for POST /inject.
@@ -596,6 +638,16 @@ def create_app(orch: Orchestrator) -> "FastAPI":
                  "status": t.status.value, "detail": t.detail}
                 for t in o.registry.all()
             ]
+        }
+
+    @app.post("/reset")
+    async def reset() -> dict:
+        """Restore a clean slate between demo runs: see Orchestrator.reset."""
+        o: Orchestrator = app.state.orch
+        await o.reset()
+        return {
+            "tasks": [],
+            "device": o.device.snapshot(),
         }
 
     @app.get("/state")

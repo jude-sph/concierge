@@ -184,6 +184,20 @@
     color: var(--fg-faint); white-space: pre-wrap; word-break: break-word;
     background: var(--panel); border-radius: 8px; padding: 8px 10px;
   }
+
+  /* ---------- reset: deliberately far from the mic button in the header,
+     small and muted so it can't be hit by accident mid-demo, with its own
+     confirm dialog as a second guard against a stray click. ---------- */
+  .footer-row { display: flex; justify-content: space-between; align-items: flex-end; gap: 16px; margin-top: 8px; }
+  .footer-row details#raw-log { margin-top: 0; flex: 1 1 auto; min-width: 0; }
+  #btn-reset {
+    font-family: inherit; font-size: 11px; font-weight: 600; padding: 7px 14px;
+    border-radius: 7px; border: 1px solid var(--hairline); background: transparent;
+    color: var(--fg-faint); cursor: pointer; letter-spacing: 0.05em;
+    text-transform: uppercase; opacity: 0.6; flex: 0 0 auto;
+  }
+  #btn-reset:hover:not(:disabled) { color: var(--bad); border-color: var(--bad); opacity: 1; }
+  #btn-reset:disabled { opacity: 0.35; cursor: default; }
 </style>
 
 <header>
@@ -222,10 +236,16 @@
            placeholder="Type instead of speaking (works even if mic/TTS is unavailable)" />
     <button type="submit">Send</button>
   </form>
-  <details id="raw-log">
-    <summary>Raw events</summary>
-    <div id="event-log-body"></div>
-  </details>
+  <div class="footer-row">
+    <details id="raw-log">
+      <summary>Raw events</summary>
+      <div id="event-log-body"></div>
+    </details>
+    <button id="btn-reset" type="button"
+            title="Clear tasks and conversation, and restore the phone data to its starting state">
+      Reset demo
+    </button>
+  </div>
 </footer>
 
 <script>
@@ -319,6 +339,12 @@ function handleTranscriptEvent(msg) {
   } else {
     return; // nothing to re-render
   }
+  renderTranscript();
+}
+
+function clearTranscript() {
+  transcript.length = 0;
+  conciergeSeen = false;
   renderTranscript();
 }
 
@@ -521,6 +547,46 @@ async function pollState() {
   }
 }
 
+// --- reset: POST /reset ---------------------------------------------------------
+//
+// Restores a clean slate server-side (device data, tasks, history, any
+// pending confirmation -- see orchestrator.py's Orchestrator.reset) and then
+// clears the client-side mirrors of that same state, so the UI doesn't sit
+// there showing a stale transcript and task list against a server that has
+// already forgotten them. Deliberately guarded by a confirm() dialog on top
+// of the button's own small, muted, out-of-the-way styling -- this is meant
+// to be reachable between demo runs, not a single miss-click away mid-demo.
+
+function clearObjInPlace(obj) {
+  for (const k of Object.keys(obj)) delete obj[k];
+}
+
+async function resetDemo() {
+  if (!confirm("Reset the demo?\n\nThis clears tasks and conversation history, "
+    + "and restores the phone data to its starting state. This cannot be undone.")) {
+    return;
+  }
+  const btn = document.getElementById("btn-reset");
+  btn.disabled = true;
+  try {
+    const res = await fetch("/reset", { method: "POST" });
+    if (!res.ok) throw new Error("server returned " + res.status);
+
+    clearTranscript();
+    clearObjInPlace(lastTaskStatus);
+    clearObjInPlace(taskChangedAt);
+    clearObjInPlace(taskTerminalSince);
+    lastDeviceRows = {};
+    clearObjInPlace(deviceChangedAt);
+    firstStatePoll = true;
+    await pollState();
+  } catch (err) {
+    document.getElementById("mic-error").textContent = "reset failed: " + err.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 // --- text fallback: POST /inject -----------------------------------------------
 
 async function onInjectSubmit(e) {
@@ -712,6 +778,7 @@ function toggle() {
 
 document.getElementById("btn-start-stop").addEventListener("click", toggle);
 document.getElementById("inject-form").addEventListener("submit", onInjectSubmit);
+document.getElementById("btn-reset").addEventListener("click", resetDemo);
 connectEvents();
 pollState();
 setInterval(pollState, 500);

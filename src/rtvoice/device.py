@@ -150,5 +150,21 @@ class DeviceState:
         self._working = copy.deepcopy(self._committed)
         self._journal("rollback")
 
+    def reload(self) -> None:
+        """Discard every in-memory change and re-read `state_path` from disk.
+
+        Used by the orchestrator's /reset to restore a pristine fixture
+        between demo runs. Re-reading the SAME path this instance was
+        constructed with (rather than replacing it with a new DeviceState
+        object) matters for two reasons: the demo machine keeps a pristine
+        copy outside the repo and copies it into that path at launch, so the
+        path is the right source of truth; and every other holder of this
+        object (notably the reasoner, which keeps its own `self.device`
+        reference) sees the reloaded data without needing to be re-wired.
+        """
+        self._committed = json.loads(self.state_path.read_text(encoding="utf-8"))
+        self._working = copy.deepcopy(self._committed)
+        self._journal("reload")
+
     def snapshot(self) -> dict:
         return copy.deepcopy(self._working)
