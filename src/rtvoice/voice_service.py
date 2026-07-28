@@ -5,6 +5,8 @@ service moves to the Mac and only text crosses the wire.
 """
 from __future__ import annotations
 
+import asyncio
+import time
 from collections import deque
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
@@ -266,6 +268,9 @@ class VoiceService:
         # whatever you're playing, right now" -- None by default, so every
         # existing caller/test that never attaches a listener is unaffected.
         self.on_playback_cancel: Optional[Callable[[], Awaitable[None]]] = None
+        # Set by stop(), cleared by speak(). Lets an interruption cut short
+        # the wait for already-sent audio to finish playing.
+        self._stopped = asyncio.Event()
 
     # -- text to speech -------------------------------------------------------
     #
@@ -320,8 +325,19 @@ class VoiceService:
     @property
     def asr(self):
         if not self._asr_ready:
-            self._asr = self._asr_factory()
+            # Marked ready BEFORE the call, and failure is swallowed: this
+            # runs on the audio path, from feed_audio, once per session. A
+            # missing CUDA library or an unavailable model would otherwise
+            # raise out of feed_audio and take the microphone down entirely
+            # -- trading a worse transcript for no conversation at all. It is
+            # also retried never rather than once per chunk, which is what
+            # setting the flag first buys.
             self._asr_ready = True
+            try:
+                self._asr = self._asr_factory()
+            except Exception:
+                self._asr = None
+                self.asr_failures += 1
         return self._asr
 
     @asr.setter
@@ -427,12 +443,48 @@ class VoiceService:
         return max(0, now_ms - self.last_speech_ms)
 
     async def speak(self, text: str, utterance_id: str) -> None:
+        """Speak, and do not return until the audio would have finished.
+
+        The waiting at the end is load-bearing, not politeness. Synthesis runs
+        far faster than real time -- Kokoro produced 6.95s of speech in 208ms
+        on the demo machine -- and frames are pushed to the listener as fast as
+        they are made. So the moment the last frame is SENT, seconds of audio
+        are still queued in the browser and still playing.
+
+        Everything upstream keys off this call returning:
+
+          * `policy_state.speaking` goes false, and barge-in is gated on it.
+            Measured live, the reply was sent by 259s and the user spoke at
+            262s -- four seconds into audio they could still hear -- and no
+            Stop was emitted, because as far as the server was concerned it
+            had finished talking. Barge-in could essentially never fire.
+          * `_speak_lock` is released, so the next utterance would start
+            streaming on top of one the listener is still hearing.
+
+        Returning on real playback time makes both correct. `stop()` cuts the
+        wait short, so an interruption is still immediate.
+        """
+        self._stopped.clear()
+        started = time.monotonic()
+        sent = 0
         async for chunk in self.tts.stream(text):
             self.recorder.write_model(chunk)
+            sent += len(chunk)
             if self.on_audio_chunk is not None:
                 await self.on_audio_chunk(chunk)
 
+        remaining = sent / self.tts_sample_rate - (time.monotonic() - started)
+        if remaining > 0:
+            try:
+                await asyncio.wait_for(self._stopped.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                pass  # played to the end, uninterrupted
+
     async def stop(self) -> None:
+        # Wakes `speak` out of its wait for playback to drain, so an
+        # interruption is immediate rather than lasting until the audio would
+        # have finished on its own.
+        self._stopped.set()
         # Deliberately reads the private slot: stopping speech must never be
         # the thing that constructs a (possibly unavailable) TTS engine.
         if self._tts is not None:

@@ -111,7 +111,17 @@ def install_audio_route(app, orch) -> None:
         orch.log.append("audio_ws_connected")
         try:
             while True:
-                data = await ws.receive_bytes()
+                # receive(), not receive_bytes(): a single text frame on this
+                # socket raises KeyError('bytes') out of receive_bytes, which
+                # ends the loop and takes the microphone down for the rest of
+                # the session. Binary frames are the only ones that mean
+                # anything here, so anything else is skipped rather than fatal.
+                message = await ws.receive()
+                if message.get("type") == "websocket.disconnect":
+                    break
+                data = message.get("bytes")
+                if data is None:
+                    continue
                 chunks, buffer = chunk_pcm_bytes(buffer, data)
                 for chunk in chunks:
                     await driver.feed(chunk)

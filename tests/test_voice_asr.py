@@ -4,6 +4,8 @@ SoulX-Duplug's turn DECISIONS are kept -- they are why it was chosen, and they
 arrive at 240ms. Its transcript is not: it comes from a Chinese-first ASR
 reading a buffer whose onset its far-field gate already discarded. See asr.py.
 """
+import asyncio
+
 import numpy as np
 import pytest
 
@@ -191,3 +193,112 @@ async def test_before_any_audio_there_is_no_answer(tmp_path):
     that consults it."""
     voice = _voice(tmp_path, [{"state": "idle"}], None)
     assert voice.quiet_ms(0) is None
+
+
+@pytest.mark.asyncio
+async def test_an_asr_that_cannot_be_built_does_not_kill_the_microphone(tmp_path):
+    """A missing CUDA library must cost a worse transcript, not the session.
+
+    This is constructed lazily from feed_audio, so an exception here would
+    otherwise propagate out of the audio path and end the conversation.
+    """
+    def broken():
+        raise RuntimeError("libcublas.so.12 is not found or cannot be loaded")
+
+    voice = VoiceService(tmp_path / "session", asr_factory=broken)
+    voice.client = FakeSoulX([{"state": "speak", "text": "Change Sarah."}])
+
+    events = await voice.feed_audio(_speech())
+
+    assert events[0].transcript == "Change Sarah."
+    assert voice.asr_failures == 1
+
+
+@pytest.mark.asyncio
+async def test_a_failed_build_is_not_retried_every_chunk(tmp_path):
+    calls = []
+
+    def broken():
+        calls.append(1)
+        raise RuntimeError("no")
+
+    voice = VoiceService(tmp_path / "session", asr_factory=broken)
+    voice.client = FakeSoulX([{"state": "speak", "text": "x"}])
+
+    for _ in range(5):
+        await voice.feed_audio(_speech())
+
+    assert len(calls) == 1
+
+
+# --- speaking means playing, not synthesizing -------------------------------
+#
+# Synthesis runs far faster than real time (6.95s of speech in 208ms on the
+# demo machine), and frames go to the listener as fast as they are made. So
+# when the last frame is SENT, seconds of audio are still queued and playing.
+# Measured live: a reply was fully sent by 259s, the user spoke at 262s -- four
+# seconds into audio they could still hear -- and no Stop was emitted, because
+# `policy_state.speaking` had already gone false. Barge-in could never fire.
+
+class InstantTTS:
+    """Synthesizes a whole utterance's audio in no time at all, like Kokoro."""
+
+    def __init__(self, seconds=2.0, rate=24000):
+        self.samples = int(seconds * rate)
+        self._generation = 0
+
+    def stop(self):
+        self._generation += 1
+
+    async def stream(self, text):
+        generation = self._generation
+        for _ in range(4):
+            if generation != self._generation:
+                return
+            yield np.zeros(self.samples // 4, dtype=np.float32)
+
+
+@pytest.mark.asyncio
+async def test_speak_lasts_as_long_as_the_audio_does(tmp_path):
+    import time
+
+    voice = VoiceService(tmp_path / "session")
+    voice.tts = InstantTTS(seconds=0.5)
+
+    started = time.monotonic()
+    await voice.speak("a reply", "u1")
+    elapsed = time.monotonic() - started
+
+    assert 0.4 < elapsed < 1.0, "returned before the listener had heard it"
+
+
+@pytest.mark.asyncio
+async def test_stop_cuts_the_wait_short(tmp_path):
+    """An interruption must be immediate, not last until the audio would have
+    finished on its own."""
+    import time
+
+    voice = VoiceService(tmp_path / "session")
+    voice.tts = InstantTTS(seconds=5.0)
+
+    async def interrupt():
+        await asyncio.sleep(0.15)
+        await voice.stop()
+
+    started = time.monotonic()
+    await asyncio.gather(voice.speak("a long reply", "u1"), interrupt())
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0, "stop() did not wake speak() out of its wait"
+
+
+@pytest.mark.asyncio
+async def test_every_frame_still_reaches_the_listener(tmp_path):
+    voice = VoiceService(tmp_path / "session")
+    voice.tts = InstantTTS(seconds=0.2)
+    got = []
+    voice.on_audio_chunk = lambda c: asyncio.sleep(0, result=got.append(c))
+
+    await voice.speak("a reply", "u1")
+
+    assert sum(len(c) for c in got) == int(0.2 * 24000)
