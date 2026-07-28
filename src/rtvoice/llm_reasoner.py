@@ -136,6 +136,15 @@ RULES:
 - NEVER count anything, and never say how many records are affected. You do
   not know, and the system computes it itself from the device.
 - If you cannot tell what was meant, use "none". Do not guess at a write.
+- NEVER invent a value the user did not say. Every string in "values" and
+  "where" has to have come out of their mouth or be resolvable from the
+  schema/dates given here. Asked "can you add a place?" - which names no
+  place - the only correct answers are "none"; filling in a plausible
+  {"name": "New York Deli", "cuisine": "american"} writes a record that
+  describes nothing real and that the person never asked for, and they will
+  be told it was added. An offer to act is not an instruction to act: "can
+  you add a place", "can you delete?", "could you rename someone" are asking
+  whether the system CAN, and the answer is a conversation, not a write.
 - Earlier turns are there to resolve REFERENCES ("do it for her too", "the
   same for Marcus"), and for nothing else. A write must name its target and
   its new value in THIS turn, or inherit them from a turn that plainly
@@ -934,6 +943,15 @@ class LlmReasoner:
             # person would say it, not as an internal error dump -- this is
             # the one message that has no fact of any kind behind it.
             self.misreads += 1
+            # Start the conversation over. History is only appended to on
+            # SUCCESS, so a turn that fails to plan leaves it frozen exactly
+            # as it was -- and if that state is what caused the failure, every
+            # subsequent turn is planned against it and fails identically,
+            # forever. Measured: a session took one bad turn and then failed
+            # on "Can you tell me about my calendar?", which had worked
+            # minutes earlier and works from a clean history. Continuity is
+            # worth a lot, but not the ability to ever answer again.
+            self._history.clear()
             return [ReasonerMessage(
                 kind="failed", task_id=f"t{next(_ids)}",
                 reason="Sorry, I didn't catch what you wanted there.",
@@ -947,10 +965,29 @@ class LlmReasoner:
         for intent in plan.intents:
             out.extend(self._apply(intent))
         if out:
+            # The assistant turn is stored as the PLAN ITSELF, in the exact
+            # JSON the model is asked to produce -- not as a readable summary
+            # of it.
+            #
+            # It used to be "planned: query contacts". That put text in the
+            # assistant role that did not look like the required output, and
+            # a small model imitates the conversation it can see in preference
+            # to an instruction further up the prompt. One or two such turns
+            # were survivable; by the third the pattern won, and the model
+            # replied `planned: insert into places` -- prose, unparseable --
+            # to a request it handles correctly from a clean history. Because
+            # history only grows on success, that then froze permanently and
+            # every later turn failed the same way.
+            #
+            # Storing the real plan makes the history reinforce the format
+            # instead of fighting it, and gives the model something it can
+            # actually use: the previous filters and values, which is what
+            # "do the same for Marcus" has to resolve against.
             self._history.append({
                 "role": "assistant",
-                "content": "planned: " + "; ".join(
-                    i.operation + (f" {i.table}" if i.table else "") for i in plan.intents
+                "content": json.dumps(
+                    {"intents": [i.model_dump(exclude_none=True) for i in plan.intents]},
+                    separators=(",", ":"),
                 ),
             })
         return out or [ReasonerMessage(kind="noop")]

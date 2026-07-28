@@ -1279,3 +1279,75 @@ async def test_a_column_holding_mixed_types_sorts_without_raising(tmp_path):
 
     out = await say(reasoner, "latest messages")
     assert [m.kind for m in out] == ["ack", "done"]
+
+
+# --- the planner's own conversation ------------------------------------------
+#
+# It used to store "planned: query contacts" as the assistant turn: text in the
+# assistant role that does not look like the required output. A small model
+# imitates the conversation it can see over an instruction further up the
+# prompt -- by the third such turn the pattern won, and it replied
+# `planned: insert into places` (prose, unparseable) to a request it handles
+# correctly from a clean history. Since history only grows on success, that
+# froze permanently and every later turn failed identically.
+
+@pytest.mark.asyncio
+async def test_history_is_stored_in_the_format_the_model_must_produce(tmp_path):
+    reasoner, fake = build(tmp_path, {"intents": [
+        {"operation": "query", "table": "contacts", "where": {"group": "work"},
+         "understood_as": "look up work contacts"}]})
+
+    await say(reasoner, "who's in my work group")
+
+    assistant = [m for m in reasoner._history if m["role"] == "assistant"]
+    assert assistant, "the plan must be remembered"
+    parsed = json.loads(assistant[-1]["content"])
+    assert parsed["intents"][0]["operation"] == "query"
+    assert parsed["intents"][0]["where"] == {"group": "work"}
+
+
+@pytest.mark.asyncio
+async def test_the_stored_turn_keeps_the_filters_a_later_turn_resolves_against(tmp_path):
+    """"do the same for Marcus" has to resolve against something. A summary
+    reading "planned: update contacts" threw away the part that matters."""
+    reasoner, _ = build(tmp_path, {"intents": [
+        {"operation": "update", "table": "contacts",
+         "where": {"first_name": "Priya"}, "values": {"first_name": "Jude"},
+         "understood_as": "rename Priya"}]})
+
+    await say(reasoner, "rename Priya to Jude")
+
+    stored = [m for m in reasoner._history if m["role"] == "assistant"][-1]["content"]
+    assert "Priya" in stored and "Jude" in stored
+
+
+@pytest.mark.asyncio
+async def test_a_failed_plan_does_not_poison_every_later_turn(tmp_path):
+    """History freezes on failure, so a state that causes a failure would
+    cause it again forever. Measured: a session then failed on "Can you tell
+    me about my calendar?", which works from a clean history."""
+    good = {"intents": [{"operation": "query", "table": "contacts",
+                         "understood_as": "look up contacts"}]}
+    # Two bad replies: _complete retries once before giving up.
+    reasoner, fake = build(tmp_path, good, "not a plan", "not a plan either", good)
+
+    await say(reasoner, "tell me about my contacts")
+    assert reasoner._history
+
+    out = await say(reasoner, "can you add a place")
+    assert [m.kind for m in out] == ["failed"]
+    assert reasoner._history == [], "a bad turn must not be carried forward"
+
+    out = await say(reasoner, "tell me about my contacts")
+    assert [m.kind for m in out] == ["ack", "done"], "must recover"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_turn_is_still_reported_to_the_person(tmp_path):
+    """Clearing history must not turn a breakdown into silence -- silence is
+    indistinguishable from having been ignored."""
+    reasoner, _ = build(tmp_path, "not a plan at all")
+
+    out = await say(reasoner, "do something")
+
+    assert out[0].kind == "failed" and out[0].reason

@@ -85,6 +85,19 @@ class TaskRegistry:
             if task.status not in TERMINAL:
                 task.status = TaskStatus.CANCELLED
 
+    def drop(self, task_id: str) -> None:
+        """Forget a task entirely, as though it had never been added.
+
+        Only for the placeholder the orchestrator shows while the reasoner is
+        still planning (see Orchestrator._dispatch): it exists so the panel
+        can say work has started rather than staying blank until a result
+        arrives, and it must vanish without trace once the real tasks land.
+        Distinct from `mark_cancelled`, which is a real outcome a person may
+        be told about; this leaves nothing behind.
+        """
+        self._tasks.pop(task_id, None)
+        self._verbatim.pop(task_id, None)
+
     def get(self, task_id: str) -> Task | None:
         return self._tasks.get(task_id)
 

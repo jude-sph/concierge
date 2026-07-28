@@ -175,3 +175,19 @@ def test_a_pending_confirmation_is_flagged_as_not_to_be_restated():
     assert "Delete 1 message" not in block
     assert "rephrase" in block.lower() or "again" in block.lower()
     assert "awaiting_confirm" in block
+
+
+def test_a_task_can_be_dropped_without_trace():
+    """For the placeholder shown while the reasoner is still planning: it
+    exists so the panel can say work has started rather than staying blank
+    until a result arrives, and must vanish once the real tasks land.
+    Distinct from mark_cancelled, which is an outcome a person may be told."""
+    r = TaskRegistry()
+    r.apply(msg("ack", task_id="pending-3", understood_as="working out: hello"))
+    assert r.get("pending-3") is not None
+
+    r.drop("pending-3")
+
+    assert r.get("pending-3") is None
+    assert r.all() == []
+    r.drop("pending-3")  # idempotent

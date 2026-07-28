@@ -475,3 +475,80 @@ async def test_genuine_operation_failure_is_still_spoken(tmp_path):
         TurnEvent(UserState.COMPLETE, "get me an uber to the station", 0))
 
     assert "this phone can't do that yet" in orch.voice.spoken
+
+
+# --- what the panel and the transcript show ---------------------------------
+
+@pytest.mark.asyncio
+async def test_work_is_shown_the_moment_it_starts_not_when_it_finishes(tmp_path):
+    """Nothing entered the registry until the reasoner's `ack` came back --
+    which is after planning, i.e. after the slowest part. For the whole time
+    the system was actually thinking the panel was blank, and the first thing
+    it ever showed was a result."""
+    seen = []
+
+    class SlowReasoner:
+        tokens: dict = {}
+
+        async def handle(self, msg):
+            seen.append([t.understood_as for t in orch.registry.all()])
+            return [ReasonerMessage(kind="ack", task_id="t1",
+                                    understood_as="look up contacts"),
+                    ReasonerMessage(kind="done", task_id="t1", result="4 contacts")]
+
+    orch = make_orch(tmp_path, reasoner=SlowReasoner())
+    await orch._dispatch("tell me about my contacts")
+
+    assert seen == [["working out: tell me about my contacts"]], \
+        "the panel must show the work while the reasoner is still planning"
+    assert [t.understood_as for t in orch.registry.all()] == ["look up contacts"], \
+        "and the real task must replace it, not sit beside it"
+
+
+@pytest.mark.asyncio
+async def test_a_placeholder_never_survives_a_reasoner_failure(tmp_path):
+    """A stuck placeholder would claim work is underway that nothing will
+    ever finish."""
+    class Exploding:
+        tokens: dict = {}
+
+        async def handle(self, msg):
+            raise RuntimeError("boom")
+
+    orch = make_orch(tmp_path, reasoner=Exploding())
+    with pytest.raises(RuntimeError):
+        await orch._dispatch("tell me about my contacts")
+
+    assert orch.registry.all() == []
+
+
+@pytest.mark.asyncio
+async def test_an_answer_to_a_pending_question_gets_no_placeholder(tmp_path):
+    """It belongs to a task already on screen; a second entry would show the
+    same work twice."""
+    orch = make_orch(tmp_path)
+    orch.registry.apply(ReasonerMessage(kind="ack", task_id="t1",
+                                        understood_as="delete messages"))
+    orch.registry.apply(ReasonerMessage(kind="confirm_required", task_id="t1",
+                                        question="Delete 3 messages?"))
+    orch._pending_questions["t1"] = "Delete 3 messages?"
+    orch._sync_pending_question()
+
+    await orch._dispatch("yes")
+
+    assert not any(t.task_id.startswith("pending-") for t in orch.registry.all())
+
+
+@pytest.mark.asyncio
+async def test_the_reasoners_own_answer_is_written_down(tmp_path):
+    """It is spoken by _speak_facts, which logged nothing the transcript
+    renders -- so the system read out the contact list and the conversation
+    showed nothing between the question and whatever was said next."""
+    orch = make_orch(tmp_path)
+    await orch.on_reasoner_messages([
+        ReasonerMessage(kind="ack", task_id="t1", understood_as="look up contacts"),
+        ReasonerMessage(kind="done", task_id="t1", result="there are 4 contacts"),
+    ])
+
+    spoken = [e for e in EventLog.read(orch.log.path) if e.kind == "spoken_fact"]
+    assert [e.data["text"] for e in spoken] == ["there are 4 contacts"]

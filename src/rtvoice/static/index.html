@@ -322,18 +322,23 @@ function appendEventLog(msg) {
 //                          reply BEFORE the user's own words for exactly that
 //                          reason. user_utterance fires in the same order
 //                          orch.history is built in, so this can't happen.
-//   concierge_act       -> what the assistant said, when the concierge is on
-//   from_reasoner       -> the assistant's reply when the concierge is OFF
-//                          (the v1 default): the reasoner's own verbatim text
-//                          is what gets spoken directly.
+//   concierge_act       -> the conversational reply, when the concierge is on
+//   spoken_fact         -> the reasoner's own answer, spoken verbatim by
+//                          Orchestrator._speak_facts.
 //   tts_failed          -> TTS raised (e.g. kokoro not installed); the text
 //                          above is still correct, just mark it silent.
 //
-// concierge_act is treated as authoritative once it's been seen at all, so
-// flipping USE_CONCIERGE=1 doesn't produce two assistant lines per turn.
+// Both assistant sources are rendered, unconditionally, because both are
+// really spoken and they say different things: the concierge acknowledges,
+// the reasoner answers. This used to key off `from_reasoner` and show it only
+// while a concierge_act had never been seen -- a rule from v1, when the
+// concierge RELAYED the reasoner's words and showing both would have
+// duplicated one line. Facts stopped going through the concierge when
+// _speak_facts was introduced, so that rule quietly meant the reasoner's
+// answers were never written down at all once the concierge was switched on:
+// the system read out the contact list and the conversation showed nothing
+// between the question and whatever was said next.
 
-const SPEAK_ON = new Set(["done", "failed", "need_clarification", "confirm_required"]);
-let conciergeSeen = false;
 const transcript = [];
 
 function pushTranscript(role, text) {
@@ -355,11 +360,9 @@ function handleTranscriptEvent(msg) {
   if (msg.kind === "user_utterance" && data.text) {
     pushTranscript("user", data.text);
   } else if (msg.kind === "concierge_act") {
-    conciergeSeen = true;
     if (data.text) pushTranscript("assistant", data.text);
-  } else if (msg.kind === "from_reasoner" && !conciergeSeen && SPEAK_ON.has(data.msg_kind)) {
-    const text = data.result || data.reason || data.verbatim_text || data.question;
-    if (text) pushTranscript("assistant", text);
+  } else if (msg.kind === "spoken_fact") {
+    if (data.text) pushTranscript("assistant", data.text);
   } else if (msg.kind === "tts_failed" && data.text) {
     markLastAssistantSilent(data.text);
   } else {
@@ -370,7 +373,6 @@ function handleTranscriptEvent(msg) {
 
 function clearTranscript() {
   transcript.length = 0;
-  conciergeSeen = false;
   renderTranscript();
 }
 

@@ -47,7 +47,17 @@ class Orchestrator:
         reasoner_timeout_s: float = 20.0,
         use_concierge: bool = True,
         merge_window_ms: int = 1200,
-        merge_hold_ms: int = 900,
+        # How much CONTINUOUS SILENCE ends a command. Measured from a live
+        # session, the gap between two halves of one split command was
+        # 1.9s-4.3s, while genuinely separate turns were 5.6s or more apart --
+        # a clean separation, and 900ms sat far below the whole split range,
+        # so almost every command was cut in two.
+        #
+        # This is the merge window's real cost: the reasoner starts up to this
+        # much later. It is affordable here and nowhere else, because the
+        # concierge answers on its own model the instant the person stops --
+        # so what they HEAR is unchanged, and only the background work waits.
+        merge_hold_ms: int = 2500,
         # Longer than the longest real command measured on this system: the
         # six-fragment recording ran 21 seconds of continuous speech. At 12s
         # this valve fired in the middle of that exact utterance, dispatching
@@ -491,6 +501,28 @@ class Orchestrator:
 
         data = msg.model_dump()
         self.log.append("to_reasoner", msg_kind=data.pop("kind"), **data)
+
+        # Show that work has STARTED, now, rather than when it finishes.
+        #
+        # The tasks panel is driven by the registry, and nothing entered the
+        # registry until the reasoner's `ack` came back -- which is after
+        # planning, i.e. after the slowest part. So for the whole time the
+        # system was actually thinking, the panel showed nothing, and the
+        # first thing it ever showed was a result. A placeholder is created
+        # here and the real `ack` overwrites it in place, keeping the same
+        # task id, so this never becomes a second entry.
+        #
+        # Only for a fresh utterance: a clarification_answer belongs to a task
+        # that is already on screen, and giving it one of its own would show
+        # the same work twice.
+        placeholder = None
+        if msg.kind == "utterance":
+            placeholder = f"pending-{msg.seq}"
+            self.registry.apply(ReasonerMessage(
+                kind="ack", task_id=placeholder,
+                understood_as=f"working out: {text}"))
+            self.log.append("task_started", task_id=placeholder, transcript=text)
+
         try:
             replies = await asyncio.wait_for(
                 self.reasoner.handle(msg), timeout=self.reasoner_timeout_s
@@ -508,6 +540,15 @@ class Orchestrator:
                 kind="failed", task_id=msg.task_id or f"timeout-{msg.seq}",
                 reason="timed out waiting for the reasoner",
             )]
+        finally:
+            # The reasoner has spoken (or given up), so its real tasks are
+            # about to land and the placeholder has served its purpose. In a
+            # `finally` because it must go even when the wait raised -- a
+            # stuck placeholder would sit on screen claiming work is underway
+            # that nothing will ever finish. Dropped BEFORE the real messages
+            # are applied so the panel never briefly shows both.
+            if placeholder is not None:
+                self.registry.drop(placeholder)
         await self.on_reasoner_messages(replies)
 
     async def on_reasoner_messages(self, msgs: list[ReasonerMessage]) -> None:
@@ -565,6 +606,19 @@ class Orchestrator:
                                     trigger="reasoner_fact", text=text)
                     continue
                 self.history.append({"role": "assistant", "content": text})
+                # The transcript is built from the event log, and this is the
+                # ONLY path the reasoner's own answers are spoken on. Without
+                # an event of its own they were heard and never written down:
+                # the system read out the contact list and the conversation
+                # showed nothing between the question and whatever was said
+                # next. Logged before speaking, so the line appears when it
+                # starts being said rather than when it finishes.
+                # `fact_kind`, not `kind`: EventLog.append takes the event kind
+                # as its first positional parameter, so a `kind=` keyword here
+                # is a TypeError -- which _speak_facts would then raise on
+                # every single reasoner answer.
+                self.log.append("spoken_fact", text=text, fact_kind=m.kind,
+                                task_id=m.task_id)
                 self.policy_state.speaking = True
                 try:
                     await self.voice.speak(text, uuid.uuid4().hex)
