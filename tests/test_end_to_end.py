@@ -15,6 +15,21 @@ from rtvoice.registry import TaskStatus
 from rtvoice.states import TurnEvent, UserState
 
 
+def make_orch(tmp_path, **kw):
+    state = tmp_path / "device_state.json"
+    state.write_text(json.dumps({
+        "contacts": [{"id": 1, "first_name": "Sarah", "group": "work"},
+                     {"id": 2, "first_name": "Marcus", "group": "work"}]
+    }))
+    device = DeviceState(state, tmp_path / "journal.jsonl")
+    return Orchestrator(
+        reasoner=kw.pop("reasoner", ReasonerStub(device, latency_ms=0)),
+        concierge=kw.pop("concierge", FakeConcierge()),
+        voice=kw.pop("voice", FakeVoice()),
+        log=EventLog(tmp_path / "events.jsonl"), device=device, **kw,
+    )
+
+
 @pytest.fixture
 def orch(tmp_path):
     state = tmp_path / "device_state.json"
@@ -317,3 +332,67 @@ async def test_one_branch_raising_does_not_orphan_its_sibling_and_is_logged(tmp_
     assert len(concierge.calls) == 1  # the sibling branch was not orphaned
     kinds = [e.kind for e in EventLog.read(orch.log.path)]
     assert "turn_task_error" in kinds
+
+
+# --- conversation ordering: the user's turn must never appear to follow
+#     the assistant's reply to it --------------------------------------------
+
+
+class SlowDispatchReasoner:
+    """A reasoner whose handle() takes a while, so the reasoner-dispatch side
+    of on_turn_event's gather is still in flight well after the concierge
+    (which never waits on it) has already replied."""
+
+    async def handle(self, msg):
+        await asyncio.sleep(0.05)
+        return [ReasonerMessage(kind="noop")]
+
+
+@pytest.mark.asyncio
+async def test_the_users_line_is_recorded_in_history_before_the_concierges_reply(tmp_path):
+    """orch.history is what both models read as conversation context, and
+    what a transcript rendered from it would show. However long the reasoner
+    takes, and regardless of how fast the concierge answers, the user's own
+    turn must already be in history before the concierge's reply can be
+    appended to it -- never the other way round."""
+    orch = make_orch(tmp_path, reasoner=SlowDispatchReasoner())
+
+    await orch.on_turn_event(TurnEvent(UserState.COMPLETE, "Hello.", 0))
+
+    assert orch.history[0] == {"role": "user", "content": "Hello."}
+    roles = [h["role"] for h in orch.history]
+    assert roles.index("user") < roles.index("assistant")
+
+
+@pytest.mark.asyncio
+async def test_user_utterance_event_precedes_concierge_act_even_when_the_merge_window_holds_the_reasoner_dispatch(tmp_path):
+    """The live-session bug: the UI transcript is built from the event
+    stream, in arrival order, and used to key the user's line off
+    "to_reasoner" -- an event only emitted once _dispatch actually calls the
+    reasoner. An ordinary spoken utterance sits in the fragment-merge window
+    for up to merge_window_ms before that happens (see orchestrator.py's
+    merge-window comments), while the concierge answers immediately, so
+    "to_reasoner" arrives AFTER "concierge_act" and the assistant's reply
+    rendered first. "user_utterance" is logged synchronously, in the same
+    place self.history is appended to, independent of the merge window, so
+    it must always precede "concierge_act" -- and "to_reasoner" must not
+    even have happened yet.
+    """
+    orch = make_orch(tmp_path, merge_window_ms=1200)
+
+    # Deliver the turn event the way AudioDriver does: the audio clock has
+    # already reached this point, which is what makes the utterance eligible
+    # to be held in the merge window rather than bypassing it (see
+    # Orchestrator._clocked / _bypasses_merge).
+    await orch.on_tick(1000)
+    await orch.on_turn_event(TurnEvent(UserState.COMPLETE, "Hello.", 1000))
+
+    kinds = [e.kind for e in EventLog.read(orch.log.path)]
+    assert "user_utterance" in kinds
+    assert "concierge_act" in kinds
+    # The merge window is still open -- the reasoner has not been dispatched
+    # to yet, so "to_reasoner" cannot have fired at all. If the transcript
+    # were still keyed off it, at this point it would show nothing at all
+    # for the user's turn while already showing the assistant's reply.
+    assert "to_reasoner" not in kinds
+    assert kinds.index("user_utterance") < kinds.index("concierge_act")

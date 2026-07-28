@@ -165,6 +165,11 @@ class Orchestrator:
         self._force_dispatched_text = text
         self.log.append("silence_timeout", transcript=text)
         self.history.append({"role": "user", "content": text})
+        # See the matching comment in on_turn_event: this is the event the UI
+        # transcript renders the user's line from -- logged synchronously,
+        # here, rather than relying on "to_reasoner" (which _dispatch below
+        # only emits once the reasoner is actually invoked).
+        self.log.append("user_utterance", text=text)
         await self._dispatch(text)
 
     # --- merge window --------------------------------------------------------
@@ -304,6 +309,19 @@ class Orchestrator:
                     # answers this fragment now, so it must see the words that
                     # were actually just spoken, not wait for the merge.
                     self.history.append({"role": "user", "content": action.text})
+                    # Logged HERE, synchronously, before the concierge task
+                    # below is even created -- not left to "to_reasoner"
+                    # (only emitted once _dispatch actually calls the
+                    # reasoner). The merge window holds an ordinary utterance
+                    # for up to merge_window_ms before that happens, while the
+                    # concierge answers immediately; a UI built on
+                    # "to_reasoner" for its "You said" line therefore showed
+                    # the assistant's reply BEFORE the user's own words, on
+                    # every fragment that went through the merge window. This
+                    # event fires in the same order self.history is built in,
+                    # independent of merge/dispatch timing, so the transcript
+                    # can never show the reply first.
+                    self.log.append("user_utterance", text=action.text)
                     if self._bypasses_merge(action.text, ev.t_ms):
                         concurrent.append(
                             asyncio.create_task(self._dispatch(action.text)))

@@ -265,8 +265,17 @@ function appendEventLog(msg) {
 // --- transcript ---------------------------------------------------------------
 //
 // Built from the SAME event stream the raw log shows, not re-derived audio:
-//   to_reasoner        -> what the user said (post silence-timeout / merge-window,
-//                          i.e. the text the reasoner actually acted on)
+//   user_utterance      -> what the user said, logged the instant it's
+//                          recorded (see orchestrator.py's on_turn_event) --
+//                          NOT "to_reasoner", which only fires once the
+//                          reasoner is actually invoked. An ordinary
+//                          utterance can sit in the fragment-merge window for
+//                          up to merge_window_ms before that happens, while
+//                          the concierge answers immediately; a transcript
+//                          keyed on "to_reasoner" showed the assistant's
+//                          reply BEFORE the user's own words for exactly that
+//                          reason. user_utterance fires in the same order
+//                          orch.history is built in, so this can't happen.
 //   concierge_act       -> what the assistant said, when the concierge is on
 //   from_reasoner       -> the assistant's reply when the concierge is OFF
 //                          (the v1 default): the reasoner's own verbatim text
@@ -297,7 +306,7 @@ function markLastAssistantSilent(text) {
 
 function handleTranscriptEvent(msg) {
   const data = msg.data || {};
-  if (msg.kind === "to_reasoner" && data.text) {
+  if (msg.kind === "user_utterance" && data.text) {
     pushTranscript("user", data.text);
   } else if (msg.kind === "concierge_act") {
     conciergeSeen = true;
