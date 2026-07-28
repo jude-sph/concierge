@@ -952,6 +952,16 @@ def build_default_orchestrator(session_dir=None) -> Orchestrator:
         os.environ.get("SOULX_URL", "ws://localhost:8000/turn"),
         asr_factory=_build_asr,
     )
+    # Built HERE, at startup, not on the first turn of the first conversation.
+    # `VoiceService.asr` is lazy so that constructing one never requires a GPU
+    # -- but that means the first construction otherwise lands inside
+    # feed_audio, which is the one part of the system that has to keep up with
+    # the microphone. Loading Whisper there stalled it for several seconds,
+    # exactly while someone was saying their first words. Doing it before the
+    # server accepts a connection costs the same time where nobody is talking.
+    # Failure is already non-fatal (see the property): transcription falls
+    # back to the turn-taking model's own words.
+    _ = voice.asr
     # The concierge and the reasoner are configured SEPARATELY, and are meant
     # to be. They ran against one endpoint serving one model behind one mutex,
     # which made them strictly serial: measured on the demo machine, the
