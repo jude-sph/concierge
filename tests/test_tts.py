@@ -239,11 +239,13 @@ async def test_nothing_to_say_yields_nothing():
 # keep working across that boundary, because it is the same code.
 
 class _FakeHTTP:
-    """Stands in for httpx.Client; returns raw float32 PCM per clause."""
+    """Stands in for httpx.Client, speaking the server's actual wire format:
+    int16 PCM (half the bytes of float32, for audio headed to a speaker)."""
 
-    def __init__(self, samples=1200, exc=None):
+    def __init__(self, samples=1200, exc=None, level=0.3):
         self.samples = samples
         self.exc = exc
+        self.level = level
         self.sent = []
 
     def post(self, url, json=None, **kw):
@@ -251,8 +253,8 @@ class _FakeHTTP:
         if self.exc is not None:
             raise self.exc
         import httpx as _httpx
-        audio = (np.ones(self.samples, dtype=np.float32) * 0.3).tobytes()
-        return _httpx.Response(200, content=audio,
+        pcm = np.full(self.samples, int(self.level * 32767), dtype=np.int16)
+        return _httpx.Response(200, content=pcm.tobytes(),
                                request=_httpx.Request("POST", url))
 
 
@@ -273,7 +275,7 @@ async def test_a_remote_engine_streams_like_a_local_one():
 
     assert len(frames) > 1
     assert all(len(f) <= FRAME_SAMPLES for f in frames)
-    assert np.allclose(np.concatenate(frames), 0.3)
+    assert np.allclose(np.concatenate(frames), 0.3, atol=1e-4)
 
 
 @pytest.mark.asyncio
@@ -312,3 +314,29 @@ async def test_barge_in_works_across_the_wire_too():
             tts.stop()
 
     assert len(frames) == 2
+
+
+def test_clause_size_is_the_engines_decision_not_the_modules():
+    """Time-to-first-audio is (first clause length) x (1 / realtime factor).
+    At Kokoro's 20-50x, 60 characters costs 0.1s. At roughly 1x it costs
+    nearly three seconds -- which is exactly what a remote engine felt like
+    before this was engine-specific: 53 characters of first clause, 3.68s of
+    audio, 2.70s of silence spent making all of it before a single frame.
+    """
+    from rtvoice.tts import RemoteTTS
+    assert RemoteTTS.first_clause_chars < KokoroTTS.first_clause_chars
+    assert RemoteTTS.lookahead > KokoroTTS.lookahead
+
+
+@pytest.mark.asyncio
+async def test_a_slow_engine_speaks_sooner_than_a_fast_one_would():
+    """The same reply, split by the remote engine's own limits, must put less
+    audio in the first clause than the module default would."""
+    from rtvoice.tts import RemoteTTS
+    reply = "there are 6 calendar entries: standup, design review, dentist, and 3 more."
+
+    http = _FakeHTTP(samples=FRAME_SAMPLES)
+    await _drain(_remote(http).stream(reply))
+
+    assert len(http.sent[0]) <= RemoteTTS.first_clause_chars
+    assert len(http.sent[0]) < len(split_for_streaming(reply)[0])

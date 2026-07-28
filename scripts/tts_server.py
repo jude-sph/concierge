@@ -71,10 +71,24 @@ def _get_model():
         from chatterbox.tts_turbo import ChatterboxTurboTTS
         started = time.perf_counter()
         _model = ChatterboxTurboTTS.from_pretrained(device=DEVICE)
+
+        # Embed the voice ONCE, here, and never again.
+        #
+        # `generate(audio_prompt_path=...)` re-runs prepare_conditionals every
+        # single call, which re-encodes the whole reference clip before a word
+        # of the request is looked at. That is a fixed cost paid per clause,
+        # and it dominated everything: "Right," -- six characters, half a
+        # second of speech -- took 1.75s, essentially all of it re-learning a
+        # voice the model had already been told about. prepare_conditionals
+        # caches into `model.conds`, and generate() uses that when no prompt
+        # is passed.
+        if VOICE_REF:
+            _model.prepare_conditionals(VOICE_REF)
+
         # The first generation is several times slower than the rest (kernel
         # autotuning, lazy weight materialisation). Spend that here, at
         # startup, rather than on someone's first sentence.
-        _model.generate("Warming up.", audio_prompt_path=VOICE_REF)
+        _model.generate("Warming up.")
         print(f"[tts] chatterbox-turbo on {DEVICE} in "
               f"{time.perf_counter()-started:.1f}s, voice={VOICE_REF or 'default'}",
               flush=True)
@@ -111,7 +125,15 @@ def tts(say: Say) -> Response:
 
     model = _get_model()
     with _lock, torch.no_grad():
-        wav = model.generate(text, audio_prompt_path=VOICE_REF)
+        # No audio_prompt_path: the voice is already embedded (see
+        # _get_model). Passing it here would re-encode the reference clip on
+        # every clause, which is where nearly all the latency used to go.
+        wav = model.generate(text)
     audio = wav.squeeze().detach().cpu().numpy().astype(np.float32)
-    return Response(content=audio.tobytes(),
+    # int16, not float32: half the bytes for audio that is about to be played
+    # through a speaker, where 16 bits is already beyond what anyone can hear.
+    # This crosses a tunnel twice on the way to the browser, and the first
+    # clause's transfer is part of the silence before speech starts.
+    pcm = (np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16)
+    return Response(content=pcm.tobytes(),
                     media_type="application/octet-stream")

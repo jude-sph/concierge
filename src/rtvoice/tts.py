@@ -152,6 +152,26 @@ class StreamingTTS:
 
     sample_rate = OUTPUT_SAMPLE_RATE
 
+    # How much text goes into the first clause, and into the ones after it.
+    #
+    # These belong to the ENGINE, not to the module, because the right answer
+    # depends entirely on how fast it synthesizes. The first clause is the
+    # only one whose synthesis the listener experiences as silence, and its
+    # cost is (characters -> seconds of speech) x (1 / realtime factor). At
+    # Kokoro's 20-50x, 60 characters is 0.1s and nobody notices. At ~1x it is
+    # nearly THREE SECONDS, which is what "the text comes and then there's a
+    # several second delay" was: 53 characters of first clause, 3.68s of audio,
+    # 2.70s spent making all of it before a single frame went out.
+    #
+    # Later clauses want to be longer -- more context is better prosody, and
+    # by then audio is already playing, so synthesis only has to keep ahead of
+    # playback rather than beat it outright.
+    first_clause_chars = FIRST_CLAUSE_CHARS
+    clause_chars = CLAUSE_CHARS
+
+    # How many clauses may be synthesized ahead of playback.
+    lookahead = 1
+
     def __init__(self) -> None:
         self._generation = 0
 
@@ -164,15 +184,19 @@ class StreamingTTS:
 
     async def stream(self, text: str) -> AsyncIterator[np.ndarray]:
         generation = self._generation
-        clauses = split_for_streaming(text)
+        clauses = split_for_streaming(text, self.first_clause_chars,
+                                      self.clause_chars)
         if not clauses:
             return
 
-        # Depth 1: synthesis stays exactly one clause ahead of playback.
-        # Deeper would buy nothing (playback is real time, so it can never
-        # fall further behind than one clause) and would cost more work to
-        # throw away on a barge-in.
-        queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+        # How far synthesis may run ahead of playback. One clause is plenty
+        # for an engine far faster than realtime -- playback cannot fall
+        # further behind than that, and anything deeper is just more work to
+        # throw away on a barge-in. An engine running at ROUGHLY realtime is a
+        # different matter: clause n+1 then takes about as long to make as
+        # clause n takes to play, so with no buffer any wobble becomes an
+        # audible gap mid-sentence. Slow engines raise this.
+        queue: asyncio.Queue = asyncio.Queue(maxsize=self.lookahead)
 
         async def produce() -> None:
             try:
@@ -250,6 +274,17 @@ class RemoteTTS(StreamingTTS):
     reasoner result the person is waiting on.
     """
 
+    # Sized for an engine at roughly realtime rather than 30x it. The first
+    # clause is deliberately short -- about a second of speech -- because its
+    # synthesis is silence the listener is sitting through; the rest are long,
+    # because by then audio is playing and only prosody is at stake.
+    first_clause_chars = 24
+    clause_chars = 110
+    # Two clauses of buffer, not one: at ~1x realtime, making the next clause
+    # takes about as long as playing the current one, so a single-slot queue
+    # leaves no slack for a slow round trip and the sentence gaps audibly.
+    lookahead = 2
+
     def __init__(self, base_url: str = "http://127.0.0.1:8020",
                  timeout: float = 30.0) -> None:
         super().__init__()
@@ -261,7 +296,11 @@ class RemoteTTS(StreamingTTS):
         try:
             resp = self._client.post(f"{self.base_url}/tts", json={"text": clause})
             resp.raise_for_status()
-            return np.frombuffer(resp.content, dtype=np.float32).copy()
+            # int16 on the wire (see scripts/tts_server.py), float32 in the
+            # pipeline -- half the bytes across two tunnel hops, and the first
+            # clause's transfer is part of the wait before speech starts.
+            pcm = np.frombuffer(resp.content, dtype=np.int16)
+            return (pcm.astype(np.float32) / 32768.0)
         except Exception:
             self.failures += 1
             return np.zeros(0, dtype=np.float32)
