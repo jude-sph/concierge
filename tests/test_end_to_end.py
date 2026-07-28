@@ -5,7 +5,6 @@ import pytest
 from fakes import FakeConcierge, FakeVoice
 
 from rtvoice.cancellation import CancellationToken
-from rtvoice.concierge import SpeechAct
 from rtvoice.device import DeviceState
 from rtvoice.events import EventLog
 from rtvoice.llm_reasoner import LlmReasoner
@@ -229,10 +228,10 @@ class SlowConcierge:
         self.delay = delay
         self.calls = 0
 
-    async def respond(self, registry, history, trigger):
+    async def respond(self, registry, history, trigger, in_flight=None):
         self.calls += 1
         await asyncio.sleep(self.delay)
-        return SpeechAct(act="acknowledge", text="on it")
+        return "on it"
 
 
 @pytest.mark.asyncio

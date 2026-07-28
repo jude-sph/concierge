@@ -352,10 +352,11 @@ async def test_a_merge_bypassing_dispatch_still_runs_beside_the_concierge(tmp_pa
             return [ReasonerMessage(kind="noop")]
 
     class SignallingConcierge(FakeConcierge):
-        async def respond(self, registry, history, trigger):
+        async def respond(self, registry, history, trigger, in_flight=None):
             if gate["event"] is not None:
                 gate["event"].set()
-            return await super().respond(registry, history, trigger)
+            return await super().respond(registry, history, trigger,
+                                         in_flight=in_flight)
 
     orch = make(tmp_path, reasoner=GatedReasoner(), merge_window_ms=1200)
     orch.concierge = SignallingConcierge()

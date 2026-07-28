@@ -1,281 +1,174 @@
-"""The concierge: owns the conversation, never asserts task facts.
+"""The concierge: the conversational voice of the system.
 
-Three structural measures replace any inspection of generated prose:
-  1. Narrow context  - it sees only the current fact block, no history of state
-  2. Split authorship - the reasoner writes facts; the concierge frames them
-  3. Typed speech acts - validation is a schema check on typed fields
+It talks to the person. It does not touch the phone's data and it never
+reports results -- the reasoner authors those and they are spoken directly
+(see Orchestrator._speak_facts). The concierge exists to make the exchange
+feel like a conversation while slower work happens behind it: greeting,
+acknowledging, asking for the clarification the reasoner needs, and keeping
+the person informed that something is underway.
+
+WHY THIS RETURNS PLAIN TEXT
+---------------------------
+It used to return a typed speech act as JSON, with a `relay` variant that had
+to cite a task and repeat its wording verbatim. That machinery existed so a
+small model could not invent facts while reporting results. It no longer
+reports results at all, so the entire apparatus -- the JSON envelope, the
+citation validation, and two regex nets that tried to rescue replies when the
+envelope came back malformed -- was protecting a capability that had already
+moved elsewhere.
+
+The cost of keeping it was severe and measured: forcing structured output on a
+small conversational model produced bare sentences instead of JSON (1/6 valid
+on a 1.5B), pseudo-JSON that got read aloud verbatim internals and all, and a
+prompt that grew past a hundred lines of argument about output format. Plain
+text removes every one of those failure modes and puts a fast, small model
+back within reach, which is what makes the conversation feel live.
+
+The safety property that mattered is unchanged, and is now structural rather
+than validated: the concierge is never given the phone's data, so it has
+nothing to leak. Facts reach the person only from the reasoner.
 """
 from __future__ import annotations
 
-import json
-import re
-from typing import Literal, Optional
+from typing import Optional
 
 import httpx
-from pydantic import BaseModel
 
 from .registry import TaskRegistry
 
-SYSTEM_PROMPT = """You are the spoken voice of a phone assistant.
+# Deliberately short. This is sent on every turn, and every line costs latency
+# in a component whose whole job is to answer quickly. It says what the system
+# is, what it can do, and what the concierge must not claim -- nothing else.
+SYSTEM_PROMPT = """You are the voice of a phone assistant, speaking aloud.
 
-WHO YOU ARE, AND WHAT THE SYSTEM CAN ACTUALLY DO:
-The system you are the voice of CAN read and modify what's on this phone -
-contacts, messages, calendar entries, saved places. It can look any of that
-up, change it, delete it, add to it. A separate reasoning component is the
-one that actually does this: it queries the phone, and it owns every fact
-about what's on it. You never hold that data yourself and you never see it
-directly - only the reasoner's results, and only once they're ready, land in
-CURRENT TASKS below and get handed to you a moment later.
+The system you speak for can read and change what is on this phone: contacts,
+messages, calendar entries and saved places. A separate reasoning component
+does that work and holds the data. You never see the data yourself.
 
-This split is about WHO holds the data, never about what the system CAN do.
-So when the user asks about their phone's data - "what's on my calendar",
-"do you have my contacts", "can you check my messages" - that is real work
-for the reasoner, not a request you personally can't help with. NEVER say or
-imply "I don't have access", "I don't have information about X", or anything
-else that denies the capability - it's false, and it makes a system that
-just hasn't answered YET sound like one that is broken. Instead, talk the
-way a capable person would while someone else looks something up: "Let me
-check your calendar.", "One sec, pulling that up.", "Sure, let me look." The
-real answer follows on its own, spoken separately, once the reasoner has it.
+So: never say the system lacks access or cannot look something up -- it can.
+If you do not have an answer yet, say you are checking. The real answer is
+spoken separately the moment the reasoner has it, so do not invent it, and do
+not repeat the person's question back at them.
 
-Not knowing a fact YET is completely different from the system being unable
-to find out - keep that distinction sharp, because the rule below never
-softens: you may describe yourself as *looking something up*, but you may
-never *state* what it turns out to be until it's actually in front of you.
+Reply with one short spoken sentence, and nothing else. No JSON, no labels,
+no quotes around it, no placeholder text. If there is genuinely nothing worth
+saying, reply with nothing at all.
 
-RULES:
-- State a task fact ONLY if it appears in CURRENT TASKS below. This is
-  absolute and applies no matter how confident you feel or how obviously
-  the system CAN do something - capability is never a fact you're allowed to
-  invent details for.
-- To report a result: act="relay", cite the task id, and include that task's
-  exact wording verbatim. Frame it however you like, never reword the fact.
-- Don't know a fact yet? Say you're checking, or that you'll find out -
-  never guess at task status, and never claim the system can't do the
-  lookup just because you don't have the answer in hand yet.
-- Every reply is spoken aloud: one short, natural sentence. NEVER output a
-  placeholder like "..." - that gets read aloud literally. Write a real
-  sentence, or empty text if there is truly nothing worth saying.
-- Trigger "user_turn": reply right away, but make the reply FIT what was
-  actually said - never a default "On it" regardless of the utterance:
-    - A greeting, thanks, or small talk gets a matching conversational
-      reply (act="chat"). "Hello" -> "Hi there!", never "On it."
-    - A question you can just answer conversationally gets answered
-      (act="chat" or "ask") - don't acknowledge a question as if it were
-      a task.
-    - A request to look up, change, add, or remove something on the phone
-      (contacts, messages, calendar, places) IS real work for the reasoner,
-      even though you don't have the answer yourself - acknowledge it as
-      being looked into (act="acknowledge", e.g. "Let me check your
-      calendar.", "Sure, looking that up.") rather than answering as if you
-      already know, and never as a denial of capability.
-    - Only an instruction or request that hands the reasoner real work
-      to do gets a short acknowledgement (act="acknowledge", e.g. "On it.",
-      "Sure, one sec.") - filler like this belongs ONLY here, never as a
-      reflex to every turn.
-- Trigger "reasoner_update": speak only if there's something worth relaying,
-  asking, or aborting - otherwise reply with empty text.
+Match what was actually said: greet a greeting, answer small talk, and when
+the person asks for something on the phone, say you are onto it rather than
+answering as if you already knew."""
 
-OUTPUT FORMAT - read carefully:
-Your ENTIRE reply must be ONE JSON object and nothing else: no prose before
-or after it, no markdown code fences, no bare sentence on its own. The words
-you'd speak go ONLY inside that object's "text" field - they are a field
-VALUE, never your reply by itself.
-
-WRONG (a bare sentence - this is not JSON, it will be rejected):
-  On it.
-
-RIGHT (the same words, as the "text" field of a JSON object):
-  {"act": "acknowledge", "text": "On it."}
-
-More valid envelopes - again, the quoted words are field values inside the
-object, never output on their own:
-  {"act": "relay", "cites": "t1", "text": "Found it - renamed 47 contacts."}
-  {"act": "ask", "text": "Which one did you mean?"}
-  {"act": "abort", "cites": "t1"}
-  {"act": "chat", "text": "Sure, what else?"}
-"""
-
-# A model that ignores the envelope instruction and emits the bare spoken
-# sentence instead of the JSON object wrapping it (empirically: raw='On it.'
-# against a real 7B model, on every call of a six-call run). A prompt rule is
-# not a guarantee, so this is a second, structural line of defence: if the
-# body fails to parse as JSON at all, but looks like ordinary short spoken
-# prose rather than a mangled/truncated JSON attempt, salvage it as a safe
-# act instead of losing the whole turn to a JSONDecodeError. Anything that
-# still contains brace/bracket punctuation is presumed to be broken JSON, not
-# prose, and is left to raise - only true bare-text replies are salvaged.
-_BARE_REPLY_MAX_CHARS = 200
-
-# A live session produced a body with NO brace/bracket punctuation that still
-# was not prose: a pseudo-JSON serialization of the speech act itself --
-# act="relay", cites="t3", text="...verbatim internals...". The brace/bracket
-# check above let it straight through, and it was spoken aloud verbatim,
-# internals and all. This is the second, narrower net: any of the schema's
-# own field names used as a key (quoted or not, "=" or ":" as the separator),
-# or the general shape of a serialized key="value" pair regardless of field
-# name, marks `text` as structured data rather than a sentence a person
-# would say. When in doubt here, the reply is NOT salvaged -- it is left to
-# raise, exactly like broken JSON -- because silence is far better than
-# reading internals aloud.
-_SPEECH_ACT_FIELD_RE = re.compile(
-    r"""["']?\b(act|cites|text|kind|task_id|understood_as)\b["']?\s*[:=]""",
-    re.IGNORECASE,
-)
-_KEY_VALUE_RE = re.compile(r"""[A-Za-z_]\w*\s*=\s*["']""")
+# Long enough for a spoken sentence, short enough that a rambling model gets
+# cut off rather than monologuing at the person.
+MAX_REPLY_CHARS = 240
 
 
-def _looks_like_structured_data(text: str) -> bool:
-    """True if `text` reads as serialized fields rather than a sentence a
-    person would actually say."""
-    return bool(_SPEECH_ACT_FIELD_RE.search(text) or _KEY_VALUE_RE.search(text))
+def clean_reply(text: str) -> str:
+    """Normalise a model reply into something safe to speak.
 
-
-def _looks_like_bare_reply(text: str) -> bool:
-    text = text.strip()
-    if not text or len(text) > _BARE_REPLY_MAX_CHARS:
-        return False
-    if "{" in text or "[" in text:
-        return False
-    return not _looks_like_structured_data(text)
-
-
-# A reply that is nothing but an unfilled template slot - the model copying
-# "..." (or a bracketed placeholder) straight out of the format spec above
-# instead of writing a real sentence. Caught here, not just warned against in
-# the prompt, because "the model was told not to" is not a guarantee: this
-# is exactly the failure a live session produced. Matches the WHOLE reply
-# (not e.g. a trailing ellipsis inside real prose like "hold on...").
-_PLACEHOLDER_RE = re.compile(r"^(\.{2,}|…|\[[.\s…]*\]|<[.\s…]*>)$")
-
-SPEECH_ACT_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "act": {"type": "string", "enum": ["relay", "ask", "acknowledge", "abort", "chat"]},
-        "text": {"type": "string"},
-        "cites": {"type": ["string", "null"]},
-    },
-    "required": ["act"],
-}
-
-
-class SpeechAct(BaseModel):
-    act: Literal["relay", "ask", "acknowledge", "abort", "chat"]
-    text: str = ""
-    cites: Optional[str] = None
-
-
-def validate_act(act: SpeechAct, registry: TaskRegistry) -> tuple[bool, str]:
-    """Schema-level check on typed fields, plus one narrow structural check on
-    the text: is it a real sentence, or an unfilled placeholder copied from
-    the format spec? That is a shape check ("is this a template slot"), not an
-    inspection of what the sentence claims - facts are still policed only via
-    the relay/cites/verbatim-span checks below.
+    Small models wrap replies in quotes, prefix them with a speaker label, or
+    fence them as code even when asked for a bare sentence. None of that
+    should reach a text-to-speech engine, and a placeholder like "..." is read
+    aloud literally, so it is dropped entirely rather than spoken.
     """
-    if act.text and _PLACEHOLDER_RE.match(act.text.strip()):
-        return False, f"reply text is a placeholder, not a real sentence: {act.text!r}"
-    if act.act == "relay":
-        if not act.cites:
-            return False, "relay requires cites"
-        if registry.get(act.cites) is None:
-            return False, f"unknown task id: {act.cites}"
-        span = registry.verbatim_span(act.cites)
-        if not span:
-            return False, f"no fact recorded yet for task {act.cites}"
-        if span not in act.text:
-            return False, f"relay must contain the verbatim span: {span!r}"
-    if act.act == "abort":
-        if not act.cites or act.cites not in registry.live_ids():
-            return False, "abort requires a live task id"
-    return True, ""
+    reply = (text or "").strip()
+
+    if reply.startswith("```"):
+        reply = reply.split("\n", 1)[-1] if "\n" in reply else ""
+        reply = reply.rsplit("```", 1)[0].strip()
+
+    # "Assistant: hello" / "concierge - hello"
+    for label in ("assistant:", "concierge:", "reply:", "response:"):
+        if reply.lower().startswith(label):
+            reply = reply[len(label) :].strip()
+
+    if len(reply) >= 2 and reply[0] == reply[-1] and reply[0] in "\"'":
+        reply = reply[1:-1].strip()
+
+    # A reply that is only punctuation or an ellipsis is a placeholder, not
+    # speech. Saying nothing is better than saying "dot dot dot".
+    if not any(ch.isalnum() for ch in reply):
+        return ""
+
+    if len(reply) > MAX_REPLY_CHARS:
+        cut = reply[:MAX_REPLY_CHARS]
+        stop = max(cut.rfind("."), cut.rfind("!"), cut.rfind("?"))
+        reply = cut[: stop + 1] if stop > 40 else cut.rstrip() + "."
+
+    return reply
 
 
 class Concierge:
-    """Async LLM client for generating validated speech acts.
+    """Speaks to the person. Holds no device data, reports no results."""
 
-    Attributes:
-        violations: Count of invalid speech act generations (not turns). Incremented
-            each time a model generation fails schema validation, or arrives as a bare,
-            unparseable-as-JSON reply salvaged into a safe act (see `_complete`). A
-            single turn can contribute up to 2 to this counter (initial attempt plus
-            one re-prompt before fallback). Use this metric to track generation
-            quality, not turn success rate.
-    """
     def __init__(
         self,
         base_url: str = "http://localhost:8001/v1",
-        model: str = "Qwen/Qwen3-4B",
-        timeout: float = 10.0,
+        model: str = "Qwen/Qwen2.5-3B-Instruct",
+        timeout: float = 20.0,
     ) -> None:
         self.base_url = base_url
         self.model = model
         self._client = httpx.AsyncClient(timeout=timeout)
-        self.violations = 0  # invalid generations, not turns
-
-    async def _complete(self, messages: list[dict]) -> tuple[SpeechAct, bool]:
-        """Returns (act, salvaged). `salvaged` is True when the body wasn't
-        valid JSON at all but looked like ordinary short spoken prose, so it
-        was wrapped into a safe chat act rather than raising - the caller
-        still must count that as an invalid generation."""
-        resp = await self._client.post(
-            f"{self.base_url}/chat/completions",
-            json={
-                "model": self.model,
-                "messages": messages,
-                # One short spoken sentence plus a little JSON scaffolding
-                # (act/cites/text) - even the longest verbatim span this ever
-                # has to carry (an unfiltered-delete confirmation) fits with
-                # room to spare. Kept well under the old 200 so a slow model
-                # can't burn the turn's latency budget on an oversized reply.
-                "max_tokens": 100,
-                "temperature": 0.6,
-                "guided_json": SPEECH_ACT_SCHEMA,
-            },
-        )
-        resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"]
-        try:
-            return SpeechAct(**json.loads(content)), False
-        except json.JSONDecodeError:
-            if not _looks_like_bare_reply(content):
-                raise
-            # Salvage, never relay: a bare reply carries no citation and no
-            # verified verbatim span, so the only thing it can ever become is
-            # a safe, non-factual act. act="chat" is hardcoded here - never
-            # derived from the model's text - so this path can never produce
-            # a "relay".
-            return SpeechAct(act="chat", text=content.strip()), True
+        # Kept for the instruments: how often a reply had to be discarded as
+        # unspeakable. It is no longer a JSON-schema violation count, but it
+        # measures the same thing -- generations this component could not use.
+        self.violations = 0
 
     async def respond(
-        self, registry: TaskRegistry, history: list[dict], trigger: str
-    ) -> SpeechAct:
-        """Generate one speech act. Re-prompts once on schema violation, then
-        falls back to acknowledge. Never rewrites the model's output."""
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "system", "content": f"CURRENT TASKS:\n{registry.fact_block()}"},
-            *history,
-            {"role": "user", "content": f"[trigger: {trigger}]"},
-        ]
+        self,
+        registry: TaskRegistry,
+        history: list[dict],
+        trigger: str,
+        in_flight: Optional[str] = None,
+    ) -> str:
+        """Return one short spoken sentence, or "" to stay silent.
 
-        act, salvaged = await self._complete(messages)
-        ok, err = validate_act(act, registry)
-        if ok:
-            if salvaged:
-                self.violations += 1
-            return act
+        `in_flight` is what the reasoner was just handed, if anything. Without
+        it the concierge is asked to speak at the exact moment nothing is
+        known yet -- which is how it ended up denying capabilities it has,
+        telling a person it had no information about their calendar while a
+        calendar lookup was already running. Being told what is underway is
+        what lets "let me check that" be a true statement rather than a guess.
+        """
+        context = []
+        if in_flight:
+            context.append(
+                f"You have just passed this to the reasoner and it is working on "
+                f"it now: {in_flight!r}. Say you are onto it. Do not answer it."
+            )
+        tasks = registry.fact_block()
+        if tasks:
+            context.append(f"Tasks already known:\n{tasks}")
 
-        self.violations += 1
-        messages.append({"role": "system", "content": f"Rejected: {err}. Try again."})
-        act, salvaged = await self._complete(messages)
-        ok, _ = validate_act(act, registry)
-        if ok:
-            if salvaged:
-                self.violations += 1
-            return act
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        if context:
+            messages.append({"role": "system", "content": "\n\n".join(context)})
+        messages.extend(history[-8:])
 
-        self.violations += 1
-        return SpeechAct(act="acknowledge", text="Let me check on that.")
+        try:
+            resp = await self._client.post(
+                f"{self.base_url}/chat/completions",
+                json={
+                    "model": self.model,
+                    "messages": messages,
+                    "max_tokens": 60,
+                    "temperature": 0.7,
+                },
+            )
+            resp.raise_for_status()
+            raw = resp.json()["choices"][0]["message"]["content"]
+        except Exception:
+            # The conversational layer is not allowed to take down a turn.
+            # The reasoner's work continues regardless and its result is
+            # spoken by a path that does not involve this component at all.
+            self.violations += 1
+            return ""
+
+        reply = clean_reply(raw)
+        if not reply:
+            self.violations += 1
+        return reply
 
     async def aclose(self) -> None:
         await self._client.aclose()

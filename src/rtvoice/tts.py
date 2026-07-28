@@ -42,7 +42,7 @@ def _resample(audio: np.ndarray, src: int, dst: int) -> np.ndarray:
 class KokoroTTS:
     sample_rate = OUTPUT_SAMPLE_RATE
 
-    def __init__(self, voice: str = "af_heart", lang_code: str = "a") -> None:
+    def __init__(self, voice: str = "am_puck", lang_code: str = "a") -> None:
         from kokoro import KPipeline  # imported lazily; needs GPU deps
 
         self._pipeline = KPipeline(lang_code=lang_code)

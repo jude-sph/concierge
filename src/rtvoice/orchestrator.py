@@ -80,6 +80,10 @@ class Orchestrator:
         # created). A COMPLETE carrying MORE text than this is genuinely new
         # content and is dispatched normally.
         self._force_dispatched_text: str | None = None
+        # The utterance most recently handed to the reasoner. The
+        # concierge is asked to speak while that work is still running,
+        # so this is what lets it say something true about it.
+        self._in_flight: str | None = None
 
         # --- fragment merge window ------------------------------------------
         #
@@ -322,6 +326,7 @@ class Orchestrator:
                     # independent of merge/dispatch timing, so the transcript
                     # can never show the reply first.
                     self.log.append("user_utterance", text=action.text)
+                    self._in_flight = action.text
                     if self._bypasses_merge(action.text, ev.t_ms):
                         concurrent.append(
                             asyncio.create_task(self._dispatch(action.text)))
@@ -337,7 +342,11 @@ class Orchestrator:
                 # all, rather than it still speaking filler on every ordinary
                 # turn.
                 if self.use_concierge:
-                    concurrent.append(asyncio.create_task(self._ask_concierge(action.trigger)))
+                    # Hand it the words that just went to the reasoner. The
+                    # concierge speaks concurrently with that work, so this is
+                    # the only way it can know anything is happening at all.
+                    concurrent.append(asyncio.create_task(
+                        self._ask_concierge(action.trigger, in_flight=self._in_flight)))
 
         if concurrent:
             # return_exceptions=True: one branch raising must not leave its
@@ -501,38 +510,42 @@ class Orchestrator:
                 finally:
                     self.policy_state.speaking = False
 
-    async def _ask_concierge(self, trigger: str) -> None:
+    async def _ask_concierge(self, trigger: str, in_flight: str | None = None) -> None:
         # Snapshot the speech generation before doing anything async. If a
         # Stop() (barge-in from a later turn) bumps it while we're waiting on
         # the concierge or on the speak lock, this reply is stale by the time
         # we'd speak it and must be dropped rather than played over -- or
         # after -- whatever superseded it.
         gen = self._speech_gen
-        act = await self.concierge.respond(self.registry, self.history, trigger)
-        self.log.append("concierge_act", act=act.act, cites=act.cites, text=act.text,
+        # `in_flight` is the utterance just handed to the reasoner, if any.
+        # The concierge is asked to speak at the moment the reasoner has not
+        # answered yet; without knowing that a lookup is running it has
+        # nothing truthful to say about it, and would tell the person it has
+        # no information about their calendar while a calendar lookup is in
+        # progress. This is what makes "let me check" true.
+        text = await self.concierge.respond(
+            self.registry, self.history, trigger, in_flight=in_flight
+        )
+        self.log.append("concierge_act", act="say", cites=None, text=text,
                         violations=getattr(self.concierge, "violations", 0))
 
-        if act.act == "abort" and act.cites:
-            await self._abort(act.cites)
-            return
-
-        if not act.text:
+        if not text:
             return
 
         async with self._speak_lock:
             if gen != self._speech_gen:
-                self.log.append("speak_skipped_stale", trigger=trigger, text=act.text)
+                self.log.append("speak_skipped_stale", trigger=trigger, text=text)
                 return
-            self.history.append({"role": "assistant", "content": act.text})
+            self.history.append({"role": "assistant", "content": text})
             self.policy_state.speaking = True
             try:
-                await self.voice.speak(act.text, uuid.uuid4().hex)
+                await self.voice.speak(text, uuid.uuid4().hex)
             except Exception as exc:
                 # See the matching comment in on_reasoner_messages: TTS being
                 # unavailable (no kokoro, no GPU) must not crash the caller.
                 # The reply text is already in history, so the transcript is
                 # right even when nothing is heard.
-                self.log.append("tts_failed", text=act.text, error=repr(exc),
+                self.log.append("tts_failed", text=text, error=repr(exc),
                                 error_type=type(exc).__name__)
             finally:
                 self.policy_state.speaking = False

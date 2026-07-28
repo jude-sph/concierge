@@ -1,219 +1,164 @@
-import json
+"""The concierge returns plain spoken text.
 
+It used to emit a typed JSON speech act with a `relay` variant that cited a
+task and repeated its wording verbatim. That machinery guarded against a small
+model inventing facts while reporting results -- but results no longer pass
+through the concierge at all (Orchestrator._speak_facts speaks them directly),
+so the guard was protecting a job that had already moved. Its replacement is
+structural: the concierge is never handed the phone's data, so it has nothing
+to leak.
+
+What is left to test is what actually reaches the speaker, and that the
+conversational layer can never take down a turn.
+"""
+import httpx
 import pytest
 
-from rtvoice.concierge import Concierge, SpeechAct, validate_act
+from rtvoice.concierge import MAX_REPLY_CHARS, Concierge, clean_reply
 from rtvoice.protocol import ReasonerMessage
 from rtvoice.registry import TaskRegistry
 
 
-def registry_with_done_task():
-    r = TaskRegistry()
-    r.apply(ReasonerMessage(kind="ack", task_id="t1", understood_as="rename contacts"))
-    r.apply(ReasonerMessage(kind="done", task_id="t1", result="renamed 47 contacts"))
-    return r
+# --- clean_reply: what actually reaches the speaker -----------------------
+
+def test_a_plain_sentence_passes_through():
+    assert clean_reply("Let me check your calendar.") == "Let me check your calendar."
 
 
-def test_acknowledge_needs_no_citation():
-    ok, _ = validate_act(SpeechAct(act="acknowledge", text="on it"), TaskRegistry())
-    assert ok
+def test_surrounding_quotes_are_stripped():
+    # Small models routinely quote the sentence they were asked to produce.
+    assert clean_reply('"Sure, one sec."') == "Sure, one sec."
+    assert clean_reply("'On it.'") == "On it."
 
 
-def test_chat_needs_no_citation():
-    ok, _ = validate_act(SpeechAct(act="chat", text="sure, what else?"), TaskRegistry())
-    assert ok
+def test_a_speaker_label_is_stripped():
+    assert clean_reply("Assistant: Hi there!") == "Hi there!"
+    assert clean_reply("concierge: Hi there!") == "Hi there!"
 
 
-def test_relay_without_citation_is_rejected():
-    ok, err = validate_act(
-        SpeechAct(act="relay", text="I renamed all your contacts"), registry_with_done_task()
-    )
-    assert not ok
-    assert "cites" in err
+def test_markdown_fences_are_stripped():
+    assert clean_reply("```\nOn it.\n```") == "On it."
 
 
-def test_relay_citing_unknown_task_is_rejected():
-    ok, err = validate_act(
-        SpeechAct(act="relay", text="done", cites="nope"), registry_with_done_task()
-    )
-    assert not ok
-    assert "unknown" in err
+@pytest.mark.parametrize("placeholder", ["...", "…", "  ", "", "-", "!!!"])
+def test_placeholders_are_dropped_rather_than_spoken(placeholder):
+    """A reply with nothing in it must produce silence.
+
+    "..." was previously read out literally as "dot dot dot" -- a model
+    copying the placeholder straight out of its own prompt template.
+    """
+    assert clean_reply(placeholder) == ""
 
 
-def test_relay_missing_the_verbatim_span_is_rejected():
-    """The whole point: the concierge may not restate a fact in its own words."""
-    ok, err = validate_act(
-        SpeechAct(act="relay", text="all done with your contacts!", cites="t1"),
-        registry_with_done_task(),
-    )
-    assert not ok
-    assert "verbatim" in err
+def test_a_real_sentence_ending_in_an_ellipsis_survives():
+    assert clean_reply("Hold on, let me check...") == "Hold on, let me check..."
 
 
-def test_relay_containing_the_verbatim_span_is_accepted():
-    ok, _ = validate_act(
-        SpeechAct(act="relay", text="Okay — renamed 47 contacts. Anything else?", cites="t1"),
-        registry_with_done_task(),
-    )
-    assert ok
+def test_a_rambling_reply_is_cut_at_a_sentence_boundary():
+    long_reply = ("Sure thing, I can help with that. " * 20).strip()
+    out = clean_reply(long_reply)
+    assert len(out) <= MAX_REPLY_CHARS
+    assert out.endswith(".")
 
 
-def test_abort_requires_a_live_task():
-    r = TaskRegistry()
-    r.apply(ReasonerMessage(kind="ack", task_id="t1", understood_as="rename"))
-    ok, _ = validate_act(SpeechAct(act="abort", cites="t1"), r)
-    assert ok
-    ok, err = validate_act(SpeechAct(act="abort", cites="ghost"), r)
-    assert not ok
+# --- respond(): the conversational call -----------------------------------
 
+class _FakePost:
+    """Stands in for httpx.AsyncClient.post; records what was sent."""
 
-def test_relay_citing_pending_task_requires_fact():
-    """A relay citing a task that is only ack'd (PENDING) has no fact to relay yet."""
-    r = TaskRegistry()
-    r.apply(ReasonerMessage(kind="ack", task_id="t1", understood_as="rename contacts"))
-    # t1 is pending; no done/confirm_required/failed message
-    ok, err = validate_act(
-        SpeechAct(act="relay", text="Renaming your contacts now", cites="t1"),
-        r,
-    )
-    assert not ok
-    assert "fact recorded yet" in err or "no fact" in err
+    def __init__(self, content=None, exc=None):
+        self.content = content
+        self.exc = exc
+        self.payloads = []
 
+    async def __call__(self, url, json=None, **kw):
+        self.payloads.append(json)
+        if self.exc is not None:
+            raise self.exc
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": self.content}}]},
+            request=httpx.Request("POST", url),
+        )
 
-def test_bare_placeholder_text_is_rejected():
-    """The live-session failure: the model copied the '{"text": "..."}'
-    template slot straight out of the format spec, and it was spoken aloud
-    verbatim as literal dots. A bare placeholder must never pass validation,
-    for any act."""
-    ok, err = validate_act(SpeechAct(act="acknowledge", text="..."), TaskRegistry())
-    assert not ok
-    assert "placeholder" in err
-
-
-def test_placeholder_variants_are_rejected():
-    for text in ["...", "…", "....", "[...]", "<...>", "  ...  "]:
-        ok, _ = validate_act(SpeechAct(act="chat", text=text), TaskRegistry())
-        assert not ok, f"{text!r} should have been rejected as a placeholder"
-
-
-def test_a_real_sentence_that_happens_to_end_in_an_ellipsis_is_fine():
-    """Only a BARE placeholder is rejected -- an ellipsis used as ordinary
-    punctuation inside a real sentence must not be caught by the same net."""
-    ok, _ = validate_act(SpeechAct(act="chat", text="hold on, let me check..."),
-                         TaskRegistry())
-    assert ok
-
-
-def test_relay_citing_running_task_requires_fact():
-    """A relay citing a task that is only progress'd (RUNNING) has no fact to relay yet."""
-    r = TaskRegistry()
-    r.apply(ReasonerMessage(kind="ack", task_id="t1", understood_as="rename contacts"))
-    r.apply(ReasonerMessage(kind="progress", task_id="t1", update="5 renamed so far"))
-    # t1 is running; no done/confirm_required/failed message
-    ok, err = validate_act(
-        SpeechAct(act="relay", text="Renaming your contacts now", cites="t1"),
-        r,
-    )
-    assert not ok
-    assert "fact recorded yet" in err or "no fact" in err
-
-
-# --- Concierge._complete / respond: the unparseable-reply fallback ----------
-#
-# Empirically, against a real 7B model, six consecutive `user_turn` calls all
-# returned bare text ("On it.", "Sure, what else?") instead of the required
-# JSON envelope -- every one failed json.loads and the turn was lost to a
-# JSONDecodeError. These tests fake the HTTP layer to reproduce that body
-# verbatim and check the defensive fallback in concierge.py, not just the
-# prompt wording (a prompt rule is not a guarantee).
-
-
-class _FakeResponse:
-    def __init__(self, content: str) -> None:
-        self._content = content
-
-    def raise_for_status(self) -> None:
-        pass
-
-    def json(self) -> dict:
-        return {"choices": [{"message": {"content": self._content}}]}
-
-
-def _concierge_replying(content: str) -> Concierge:
-    """A Concierge whose HTTP POST always returns `content` verbatim as the
-    model's raw completion body -- the only thing faked, same technique used
-    for LlmReasoner in test_llm_reasoner.py."""
-    c = Concierge()
-
-    async def fake_post(url, **kw):
-        return _FakeResponse(content)
-
-    c._client.post = fake_post
-    return c
+    def system_text(self):
+        return " ".join(m["content"] for m in self.payloads[0]["messages"]
+                        if m["role"] == "system")
 
 
 @pytest.mark.asyncio
-async def test_bare_text_reply_becomes_a_safe_spoken_act_not_a_crash():
-    """The live-session failure this fix targets: a bare sentence instead of
-    the JSON envelope must not raise JSONDecodeError out of respond() and
-    lose the turn -- it must surface as a safe spoken act, and it must be
-    counted as a violation so the regression is visible in the metrics."""
-    c = _concierge_replying("On it.")
-    act = await c.respond(TaskRegistry(), [], trigger="user_turn")
-    assert act.act in ("chat", "acknowledge")
-    assert act.text == "On it."
+async def test_respond_returns_the_spoken_sentence(monkeypatch):
+    c = Concierge()
+    monkeypatch.setattr(c._client, "post", _FakePost(content="Let me check that."))
+    assert await c.respond(TaskRegistry(), [], "user_turn") == "Let me check that."
+
+
+@pytest.mark.asyncio
+async def test_the_in_flight_utterance_is_given_to_the_model(monkeypatch):
+    """Without this the concierge speaks blind.
+
+    It is asked to reply at the moment the reasoner has not answered yet.
+    Told nothing about what is running, it denied a capability it has --
+    "I don't have information about your calendar" while a calendar lookup
+    was already in progress. Knowing what is in flight is what makes
+    "let me check that" a true statement.
+    """
+    c = Concierge()
+    post = _FakePost(content="Let me check your calendar.")
+    monkeypatch.setattr(c._client, "post", post)
+
+    await c.respond(TaskRegistry(), [], "user_turn",
+                    in_flight="tell me about my calendar")
+
+    assert "tell me about my calendar" in post.system_text()
+
+
+@pytest.mark.asyncio
+async def test_known_tasks_are_given_to_the_model(monkeypatch):
+    r = TaskRegistry()
+    r.apply(ReasonerMessage(kind="ack", task_id="t1", understood_as="rename contacts"))
+    c = Concierge()
+    post = _FakePost(content="On it.")
+    monkeypatch.setattr(c._client, "post", post)
+
+    await c.respond(r, [], "user_turn")
+
+    assert "rename contacts" in post.system_text()
+
+
+@pytest.mark.asyncio
+async def test_an_unreachable_model_is_silent_not_fatal(monkeypatch):
+    """The conversational layer must never take down a turn.
+
+    The reasoner's work proceeds regardless, and its result is spoken by a
+    path that does not involve this component at all.
+    """
+    c = Concierge()
+    monkeypatch.setattr(c._client, "post",
+                        _FakePost(exc=httpx.ConnectError("refused")))
+    assert await c.respond(TaskRegistry(), [], "user_turn") == ""
     assert c.violations == 1
 
 
 @pytest.mark.asyncio
-async def test_bare_text_reply_can_never_become_a_relay():
-    """An unparsed reply carries no citation and no verified verbatim span,
-    so it must never be used to state a task fact -- even when the bare text
-    happens to look exactly like a citation and its verbatim span."""
-    act = await _concierge_replying("t1: renamed 47 contacts").respond(
-        registry_with_done_task(), [], trigger="reasoner_update"
-    )
-    assert act.act != "relay"
+async def test_an_unspeakable_reply_is_counted_and_silenced(monkeypatch):
+    c = Concierge()
+    monkeypatch.setattr(c._client, "post", _FakePost(content="..."))
+    assert await c.respond(TaskRegistry(), [], "user_turn") == ""
+    assert c.violations == 1
 
 
 @pytest.mark.asyncio
-async def test_pseudo_json_speech_act_is_never_salvaged_and_spoken_verbatim():
-    """The CRITICAL live-session failure: the model emitted a pseudo-JSON
-    serialization of the speech act itself, with no brace/bracket
-    punctuation at all, so the old bare-reply check let it straight through
-    and it was spoken aloud verbatim, internals and all:
+async def test_history_is_bounded(monkeypatch):
+    """A long session must not grow the prompt without limit -- every token
+    is latency in the component whose whole job is to answer quickly."""
+    c = Concierge()
+    post = _FakePost(content="Sure.")
+    monkeypatch.setattr(c._client, "post", post)
 
-        act="relay", cites="t3", text="This will rename Sarah to Michael. \
-1 contact. Confirm?"
+    history = [{"role": "user", "content": f"line {i}"} for i in range(50)]
+    await c.respond(TaskRegistry(), history, "user_turn")
 
-    This must never be salvaged into a spoken act -- it must be treated
-    exactly like broken JSON (raise, not swallow), so it can never reach the
-    speaker."""
-    content = ('act="relay", cites="t3", text="This will rename Sarah to '
-               'Michael. 1 contact. Confirm?"')
-    c = _concierge_replying(content)
-    with pytest.raises(json.JSONDecodeError):
-        await c.respond(TaskRegistry(), [], trigger="user_turn")
-
-
-@pytest.mark.asyncio
-async def test_a_genuine_bare_sentence_still_salvages():
-    """The fix for the pseudo-JSON case above must not make the salvage path
-    itself useless: an ordinary bare spoken sentence -- the original failure
-    this fallback exists for -- must still be salvaged into a safe chat act,
-    not lost to a JSONDecodeError."""
-    c = _concierge_replying("Sure, I can help with that.")
-    act = await c.respond(TaskRegistry(), [], trigger="user_turn")
-    assert act.act == "chat"
-    assert act.text == "Sure, I can help with that."
-
-
-@pytest.mark.asyncio
-async def test_malformed_json_is_not_swallowed_as_if_it_were_prose():
-    """Truncated/garbled JSON (still containing brace punctuation) is a
-    different failure from bare spoken text and must not be salvaged -- only
-    genuine bare-text replies are. Re-prompting repeats the same malformed
-    body here, so the error still propagates out of respond()."""
-    c = _concierge_replying('{"act": "chat", "text": "On it.')
-    with pytest.raises(json.JSONDecodeError):
-        await c.respond(TaskRegistry(), [], trigger="user_turn")
+    spoken = [m for m in post.payloads[0]["messages"] if m["role"] != "system"]
+    assert len(spoken) <= 8
+    assert spoken[-1]["content"] == "line 49"
