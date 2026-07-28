@@ -827,6 +827,46 @@ async def test_a_bad_intent_does_not_kill_its_siblings(tmp_path):
     assert reasoner.misreads == 1
 
 
+@pytest.mark.asyncio
+async def test_unknown_where_field_is_spoken_as_plain_english(tmp_path):
+    """The second live-session failure: asked to look up a contact, the model
+    filtered on "contact" -- a field that exists on `messages`, not
+    `contacts`. The device correctly refuses (that key isn't on this table),
+    but what got spoken was "contacts has no contact": ungrammatical, and it
+    named an internal field the user never said. The refusal must instead
+    read as something a person would say, with no raw table.field jargon."""
+    reasoner, _ = build(tmp_path, plan({
+        "operation": "query", "table": "contacts", "where": {"contact": "Tom"},
+    }))
+
+    out = await say(reasoner, "look up the contact for Tom")
+
+    assert kinds(out) == ["ack", "failed"]
+    reason = only(out, "failed").reason
+    assert reason == "I couldn't find a contact matching that."
+    assert "has no" not in reason
+    assert "contacts.contact" not in reason
+    assert reasoner.misreads == 1
+
+
+@pytest.mark.asyncio
+async def test_unknown_values_field_is_spoken_as_plain_english(tmp_path):
+    """Same defect class, but on the write side: an update naming a field the
+    table does not have must not echo the raw table/field pairing back."""
+    reasoner, _ = build(tmp_path, plan({
+        "operation": "update", "table": "contacts",
+        "where": {"first_name": "Tom"}, "values": {"nickname": "Tommy"},
+    }))
+
+    out = await say(reasoner, "set Tom's nickname to Tommy")
+
+    assert kinds(out) == ["ack", "failed"]
+    reason = only(out, "failed").reason
+    assert reason == "that's not something I can set on a contact."
+    assert "has no" not in reason
+    assert "nickname" not in reason
+
+
 # --- SAFETY: an unreachable or slow model mutates nothing --------------------
 
 

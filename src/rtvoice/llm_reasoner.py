@@ -811,38 +811,54 @@ class LlmReasoner:
         with an unknown key in `values` would silently ADD that field to every
         matched row. Rejecting is the only safe reading; there is no repair
         that is not a guess.
+
+        Every string returned here is spoken to the user verbatim (see
+        Orchestrator._speak_facts) and shown as the task's on-screen detail --
+        there is no second, separate "spoken version". A live session once
+        had a user hear "contacts has no contact": accurate to a developer,
+        meaningless (and ungrammatical) to a listener, and it named an
+        internal field ("contact") the user never typed. Every message below
+        is a plain sentence built from words a person actually said or would
+        say back -- table/field identifiers are never interpolated raw,
+        except the table's own name, which is an ordinary English noun here
+        ("contacts", "messages", "calendar", "places").
         """
         if not intent.table:
-            return "no table"
+            return "I'm not sure what that should apply to."
         fields = self._table_fields(intent.table)
         if fields is None:
             return f"there's no {intent.table} on this device"
 
+        noun = _noun(intent.table, 1)
         for source, is_where in ((intent.where or {}, True), (intent.values or {}, False)):
             for key, value in source.items():
                 # An insert into a table with no rows yet has no known fields,
                 # so anything scalar is allowed; otherwise rows stay uniform.
                 if fields and key not in fields:
-                    return f"{intent.table} has no {key}"
+                    if is_where:
+                        return f"I couldn't find a {noun} matching that."
+                    return f"that's not something I can set on a {noun}."
                 if value is not None and not isinstance(value, _SCALARS):
-                    return f"{key} can't be matched on that"
+                    if is_where:
+                        return f"I can't match a {noun} on that kind of value."
+                    return f"that's not a value I can set on a {noun}."
                 if is_where and value in _WILDCARD_VALUES:
-                    return (f'"{key}" can\'t be filtered with a wildcard - '
-                            'omit "where" to match every row')
+                    return (f"a wildcard can't be used to filter {noun}s -- "
+                            "leaving the filter out matches everyone instead")
 
         if intent.operation == "update" and not intent.values:
-            return "nothing to change"
+            return "there's nothing to change."
         if intent.operation == "insert" and not (intent.values or {}):
-            return "nothing to add"
+            return "there's nothing to add."
         if intent.operation == "insert" and intent.where:
             # An insert scoped by a filter is incoherent. It usually means the
             # model meant `update`, and guessing which would be a write nobody
             # asked for.
-            return "can't add a row and filter at the same time"
+            return f"I can't add a new {noun} while also filtering for existing ones."
         if intent.operation == "delete" and intent.values:
             # Likewise: a delete carrying new field values is almost certainly
             # a botched update, and the two differ by everything.
-            return "can't delete and set values at the same time"
+            return f"I can't delete a {noun} and change it at the same time."
         return ""
 
     # --- planning ------------------------------------------------------------
