@@ -8,6 +8,7 @@ from rtvoice.cancellation import CancellationToken
 from rtvoice.concierge import SpeechAct
 from rtvoice.device import DeviceState
 from rtvoice.events import EventLog
+from rtvoice.llm_reasoner import LlmReasoner
 from rtvoice.orchestrator import Orchestrator
 from rtvoice.protocol import ReasonerMessage
 from rtvoice.reasoner_stub import ReasonerStub
@@ -396,3 +397,82 @@ async def test_user_utterance_event_precedes_concierge_act_even_when_the_merge_w
     # for the user's turn while already showing the assistant's reply.
     assert "to_reasoner" not in kinds
     assert kinds.index("user_utterance") < kinds.index("concierge_act")
+
+
+# --- not-actionable vs. genuine failure, through the full orchestrator -----
+#
+# The live-session defect: "Don't you have access to the calendar?" is a
+# rhetorical question about the SYSTEM, not a device lookup. The reasoner
+# and the concierge both receive every finalised turn in parallel (see
+# policy.decide), so if the reasoner cannot cleanly classify a question like
+# this, its own internal fallback wording ("I couldn't work out what to do
+# with that") gets spoken as a `failed` fact, stepping on whatever the
+# concierge says for the same turn. Correctly classified as operation="none"
+# (see llm_reasoner.SYSTEM_PROMPT's worked example for exactly this
+# phrasing), nothing is spoken on the reasoner's behalf at all -- the
+# concierge alone carries the turn. A genuinely concrete request that
+# actually cannot be done must still be audible; the fix here must not
+# blur into silencing that too.
+
+
+class _FakeCompletion:
+    """Minimal stand-in for the httpx.Response the reasoner's HTTP client
+    normally returns -- same shape as FakeResponse in test_llm_reasoner.py."""
+
+    def __init__(self, content: str) -> None:
+        self._content = content
+
+    def raise_for_status(self) -> None:
+        pass
+
+    def json(self) -> dict:
+        return {"choices": [{"message": {"content": self._content}}]}
+
+
+def _llm_reasoner_replying(tmp_path, plan: dict) -> LlmReasoner:
+    state_path = tmp_path / "reasoner_device.json"
+    state_path.write_text(json.dumps({}))
+    device = DeviceState(state_path, tmp_path / "reasoner_journal.jsonl")
+    reasoner = LlmReasoner(device, base_url="http://fake/v1", model="fake-model")
+
+    async def fake_post(url, **kw):
+        return _FakeCompletion(json.dumps(plan))
+
+    reasoner._client.post = fake_post
+    return reasoner
+
+
+@pytest.mark.asyncio
+async def test_not_actionable_utterance_produces_no_spoken_failure(tmp_path):
+    reasoner = _llm_reasoner_replying(tmp_path, {"intents": [
+        {"operation": "none",
+         "understood_as": "asked whether the system can read the calendar"},
+    ]})
+    orch = make_orch(tmp_path, reasoner=reasoner)
+
+    await orch.on_turn_event(
+        TurnEvent(UserState.COMPLETE, "Don't you have access to my calendar?", 0))
+
+    # No task was ever registered, and nothing failure-shaped was spoken --
+    # the reasoner contributed silence, exactly like ordinary chit-chat.
+    assert orch.registry.all() == []
+    assert not any("couldn't work out" in s for s in orch.voice.spoken)
+    # The concierge's own reply for this turn is unaffected -- it is the
+    # only thing that spoke.
+    assert orch.voice.spoken == ["on it"]
+
+
+@pytest.mark.asyncio
+async def test_genuine_operation_failure_is_still_spoken(tmp_path):
+    """Contrast case: a real request for something the device genuinely has
+    no way to do must remain audible -- the fix above must not swallow this
+    too."""
+    reasoner = _llm_reasoner_replying(tmp_path, {"intents": [
+        {"operation": "unsupported", "understood_as": "get an uber to the station"},
+    ]})
+    orch = make_orch(tmp_path, reasoner=reasoner)
+
+    await orch.on_turn_event(
+        TurnEvent(UserState.COMPLETE, "get me an uber to the station", 0))
+
+    assert "this phone can't do that yet" in orch.voice.spoken

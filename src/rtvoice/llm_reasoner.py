@@ -80,11 +80,20 @@ OPERATIONS - the device supports these and nothing else:
                the device assigns it.
   unsupported  a real-world action with nothing on the device behind it
                (ordering a car, placing a call).
-  none         chit-chat, or nothing actionable.
+  none         chit-chat, nothing actionable, or a question ABOUT the
+               system itself rather than a request to look something up.
 
 RULES:
 - One intent per action, in the order the user said them. A compound request
   ("do X and do Y") is two intents.
+- A question about what the system can do, or whether it can do it -
+  "don't you have access to my calendar?", "can you see my messages?", "do
+  you know my contacts?" - is a question about the SYSTEM, not a lookup of
+  any row. It is "none", never "unsupported" and never a guessed table: the
+  system genuinely can read and change every table below, so there is no
+  honest "unsupported" answer to give, and there is no filter to invent
+  either, because nothing was actually asked to be found. Only an actual
+  request for a fact ("what's on my calendar", "who's Priya") is a "query".
 - Sending a message or making a booking IS an insert into the table that
   records it. Only use "unsupported" when no table could hold the result.
 - "table" must be one of the tables below. Every key in "where" and "values"
@@ -145,6 +154,14 @@ EXAMPLES (table names and dates below are illustrative, not the real device):
   {"intents": [{"operation": "query", "table": "calendar",
     "where": {"day": "2026-07-28"},
     "understood_as": "look up tomorrow's calendar"}]}
+
+  "don't you have access to my calendar?" ->
+  {"intents": [{"operation": "none",
+    "understood_as": "asked whether the system can read the calendar"}]}
+  Note: nothing was actually asked to be found, so there is no table and no
+  filter to invent - this asks ABOUT the system, not for a fact from it.
+  "none" here is not "the system can't do this"; it just means this
+  particular utterance is not itself a lookup or a write.
 
   "delete yesterday's messages from Marcus" ->
   {"intents": [{"operation": "delete", "table": "messages",
@@ -779,10 +796,21 @@ class LlmReasoner:
             # not read, so nothing is attempted and nothing is written -- but
             # the user is told, because silence is indistinguishable from the
             # system having ignored them.
+            #
+            # This is reserved for genuine breakdowns (the model unreachable,
+            # or producing nothing plan-shaped after a retry) -- not for
+            # ordinary conversation. An utterance that is actually just
+            # chit-chat, or a question about the system itself, is expected
+            # to come back as operation="none" (see SYSTEM_PROMPT's worked
+            # example) and never reaches this branch at all: `_apply` returns
+            # nothing for it, so nothing is ever spoken on the reasoner's
+            # behalf and the concierge alone carries that turn. Phrased as a
+            # person would say it, not as an internal error dump -- this is
+            # the one message that has no fact of any kind behind it.
             self.misreads += 1
             return [ReasonerMessage(
                 kind="failed", task_id=f"t{next(_ids)}",
-                reason="I couldn't work out what to do with that",
+                reason="Sorry, I didn't catch what you wanted there.",
                 understood_as=f"understand: {text}",
                 status=type(exc).__name__,
             )]

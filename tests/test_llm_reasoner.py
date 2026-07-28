@@ -322,6 +322,24 @@ async def test_conversational_input_produces_no_task(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_a_question_about_the_systems_own_capability_resolves_quietly(tmp_path):
+    """The live-session defect: 'don't you have access to my calendar?' is a
+    question ABOUT the system, not a request to look anything up. Per the
+    prompt's own worked example, that is operation='none' -- not
+    'unsupported' (which would falsely claim there's nothing behind it,
+    when there plainly is) and not a guessed query with no real filter. Read
+    as 'none', it produces no task and no failure at all: the reasoner
+    contributes silence, and the concierge alone answers this turn."""
+    reasoner, _ = build(tmp_path, plan({
+        "operation": "none",
+        "understood_as": "asked whether the system can read the calendar",
+    }))
+    out = await say(reasoner, "don't you have access to my calendar?")
+    assert kinds(out) == ["noop"]
+    assert "failed" not in kinds(out)
+
+
+@pytest.mark.asyncio
 async def test_empty_utterance_never_reaches_the_model(tmp_path):
     reasoner, fake = build(tmp_path, plan({"operation": "none"}))
     out = await say(reasoner, "   ")
