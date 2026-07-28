@@ -45,6 +45,7 @@ import asyncio
 import re
 from typing import AsyncIterator, Iterator
 
+import httpx
 import numpy as np
 
 from .resample import resample_audio
@@ -139,14 +140,19 @@ def _resample(audio: np.ndarray, src: int, dst: int) -> np.ndarray:
     return resample_audio(audio, src, dst)
 
 
-class KokoroTTS:
+class StreamingTTS:
+    """Clause splitting, lookahead synthesis and interruptible framing.
+
+    Everything here is engine-independent, so a subclass only has to turn one
+    clause of text into one array of samples. That division is what lets the
+    engine be swapped -- a small local model, or a bigger one on another
+    machine -- without touching the part that makes speech start early and
+    stop on a barge-in, which is the part with the subtle bugs in it.
+    """
+
     sample_rate = OUTPUT_SAMPLE_RATE
 
-    def __init__(self, voice: str = "am_puck", lang_code: str = "a") -> None:
-        from kokoro import KPipeline  # imported lazily; needs GPU deps
-
-        self._pipeline = KPipeline(lang_code=lang_code)
-        self.voice = voice
+    def __init__(self) -> None:
         self._generation = 0
 
     def stop(self) -> None:
@@ -154,11 +160,7 @@ class KokoroTTS:
 
     def synthesize(self, clause: str) -> np.ndarray:
         """One clause to one array. Synchronous; always called in a thread."""
-        parts = [np.asarray(audio, dtype=np.float32)
-                 for _, _, audio in self._pipeline(clause, voice=self.voice)]
-        if not parts:
-            return np.zeros(0, dtype=np.float32)
-        return np.concatenate(parts)
+        raise NotImplementedError
 
     async def stream(self, text: str) -> AsyncIterator[np.ndarray]:
         generation = self._generation
@@ -208,3 +210,58 @@ class KokoroTTS:
             # leaves a thread synthesizing audio nobody will ever hear, and
             # (worse) a task blocked forever on a full queue.
             producer.cancel()
+
+
+class KokoroTTS(StreamingTTS):
+    """Kokoro-82M, in-process. Fast (20-50x realtime on a 3090) and flat --
+    82 million parameters buys speed, not expressiveness."""
+
+    def __init__(self, voice: str = "am_puck", lang_code: str = "a") -> None:
+        from kokoro import KPipeline  # imported lazily; needs GPU deps
+
+        super().__init__()
+        self._pipeline = KPipeline(lang_code=lang_code)
+        self.voice = voice
+
+    def synthesize(self, clause: str) -> np.ndarray:
+        parts = [np.asarray(audio, dtype=np.float32)
+                 for _, _, audio in self._pipeline(clause, voice=self.voice)]
+        if not parts:
+            return np.zeros(0, dtype=np.float32)
+        return np.concatenate(parts)
+
+
+class RemoteTTS(StreamingTTS):
+    """Synthesis on another machine, over HTTP, one clause per request.
+
+    Chatterbox sounds markedly more human than Kokoro and cannot run beside
+    the rest of the system: `chatterbox-tts` requires numpy<2, which would
+    downgrade the numpy the turn-taking model depends on, and the demo box is
+    at 97% disk with 3.4GB of VRAM left. So it runs on the laptop and this
+    calls it.
+
+    One clause per request, deliberately, rather than streaming a whole
+    utterance from the server: the base class already runs a clause ahead of
+    playback, so each round trip is overlapped with speaking the previous
+    clause and only the FIRST one is ever waited on.
+
+    A failure here is silence for one utterance, never an exception into the
+    audio path -- the caller is Orchestrator._speak_facts, which is speaking a
+    reasoner result the person is waiting on.
+    """
+
+    def __init__(self, base_url: str = "http://127.0.0.1:8020",
+                 timeout: float = 30.0) -> None:
+        super().__init__()
+        self.base_url = base_url.rstrip("/")
+        self._client = httpx.Client(timeout=timeout)
+        self.failures = 0
+
+    def synthesize(self, clause: str) -> np.ndarray:
+        try:
+            resp = self._client.post(f"{self.base_url}/tts", json={"text": clause})
+            resp.raise_for_status()
+            return np.frombuffer(resp.content, dtype=np.float32).copy()
+        except Exception:
+            self.failures += 1
+            return np.zeros(0, dtype=np.float32)

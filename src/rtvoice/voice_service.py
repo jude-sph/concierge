@@ -318,7 +318,18 @@ class VoiceService:
     def _make_tts(self):
         if self._tts_factory is not None:
             return self._tts_factory()
+        import os
+
         from . import tts as tts_module
+
+        # TTS_URL selects a remote engine (see scripts/tts_server.py):
+        # Chatterbox sounds far more human than Kokoro and cannot run in this
+        # process -- it needs numpy<2, which the turn-taking model's
+        # environment cannot have. Unset, everything behaves exactly as
+        # before, which is also the fallback if that machine is not up.
+        remote = os.environ.get("TTS_URL", "").strip()
+        if remote:
+            return tts_module.RemoteTTS(remote)
 
         try:
             return tts_module.KokoroTTS()

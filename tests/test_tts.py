@@ -228,3 +228,87 @@ async def test_consecutive_streams_are_independent():
 async def test_nothing_to_say_yields_nothing():
     tts = _tts(FakePipeline(num_chunks=3))
     assert await _drain(tts.stream("   ")) == []
+
+
+# --- a remote engine, behind the same interface -----------------------------
+#
+# Chatterbox sounds far more human than Kokoro and cannot run beside the rest
+# of the system: it requires numpy<2, which would downgrade the numpy the
+# turn-taking model depends on. So it runs elsewhere and is called over HTTP --
+# and everything that makes speech start early and stop on a barge-in has to
+# keep working across that boundary, because it is the same code.
+
+class _FakeHTTP:
+    """Stands in for httpx.Client; returns raw float32 PCM per clause."""
+
+    def __init__(self, samples=1200, exc=None):
+        self.samples = samples
+        self.exc = exc
+        self.sent = []
+
+    def post(self, url, json=None, **kw):
+        self.sent.append(json["text"])
+        if self.exc is not None:
+            raise self.exc
+        import httpx as _httpx
+        audio = (np.ones(self.samples, dtype=np.float32) * 0.3).tobytes()
+        return _httpx.Response(200, content=audio,
+                               request=_httpx.Request("POST", url))
+
+
+def _remote(http):
+    from rtvoice.tts import RemoteTTS
+    tts = object.__new__(RemoteTTS)
+    tts.base_url = "http://x"
+    tts._client = http
+    tts._generation = 0
+    tts.failures = 0
+    return tts
+
+
+@pytest.mark.asyncio
+async def test_a_remote_engine_streams_like_a_local_one():
+    http = _FakeHTTP(samples=FRAME_SAMPLES * 3)
+    frames = await _drain(_remote(http).stream("Okay, hold on. I'm checking that now."))
+
+    assert len(frames) > 1
+    assert all(len(f) <= FRAME_SAMPLES for f in frames)
+    assert np.allclose(np.concatenate(frames), 0.3)
+
+
+@pytest.mark.asyncio
+async def test_the_remote_engine_is_asked_one_clause_at_a_time():
+    """Not the whole utterance: the caller runs a clause ahead of playback, so
+    every round trip after the first is overlapped with speaking the previous
+    clause and only the FIRST is ever waited on."""
+    http = _FakeHTTP()
+    text = "Okay, hold on a moment. I am checking that for you right now."
+    await _drain(_remote(http).stream(text))
+
+    assert http.sent == split_for_streaming(text)
+    assert len(http.sent) > 1
+
+
+@pytest.mark.asyncio
+async def test_a_remote_failure_is_silence_not_an_exception():
+    """The caller is _speak_facts, speaking a result someone is waiting on --
+    inside the audio path. An exception there is worse than a quiet turn."""
+    import httpx as _httpx
+    tts = _remote(_FakeHTTP(exc=_httpx.ConnectError("refused")))
+
+    assert await _drain(tts.stream("Anything at all.")) == []
+    assert tts.failures > 0
+
+
+@pytest.mark.asyncio
+async def test_barge_in_works_across_the_wire_too():
+    http = _FakeHTTP(samples=FRAME_SAMPLES * 10)
+    tts = _remote(http)
+
+    frames = []
+    async for frame in tts.stream("A long spoken sentence that keeps going."):
+        frames.append(frame)
+        if len(frames) == 2:
+            tts.stop()
+
+    assert len(frames) == 2
