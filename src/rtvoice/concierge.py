@@ -56,7 +56,11 @@ saying, reply with nothing at all.
 
 Match what was actually said: greet a greeting, answer small talk, and when
 the person asks for something on the phone, say you are onto it rather than
-answering as if you already knew."""
+answering as if you already knew.
+
+You may be shown a LOOKING UP line naming what the reasoner is fetching right
+now. That is background state for you, never something to read out: say you
+are onto it in your own words, and never answer the question yourself."""
 
 # Long enough for a spoken sentence, short enough that a rambling model gets
 # cut off rather than monologuing at the person.
@@ -131,15 +135,18 @@ class Concierge:
         calendar lookup was already running. Being told what is underway is
         what lets "let me check that" be a true statement rather than a guess.
         """
+        # Phrased as terse STATE, never as an instruction. A system message
+        # worded as a direction ("say you are onto it, do not answer it") sat
+        # immediately before the model's turn and got reproduced verbatim as
+        # the spoken reply -- the person heard "Say you are onto it. Do not
+        # answer." The behavioural rule for this line lives in SYSTEM_PROMPT
+        # instead, well away from the generation point.
         context = []
         if in_flight:
-            context.append(
-                f"You have just passed this to the reasoner and it is working on "
-                f"it now: {in_flight!r}. Say you are onto it. Do not answer it."
-            )
+            context.append(f"LOOKING UP: {in_flight}")
         tasks = registry.fact_block()
         if tasks:
-            context.append(f"Tasks already known:\n{tasks}")
+            context.append(f"TASKS:\n{tasks}")
 
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         if context:

@@ -302,15 +302,24 @@ def _describe_where(where: dict | None) -> str:
     return " and ".join(f"{k} = {_fmt(v)}" for k, v in where.items())
 
 
-def _noun(table: str, n: int) -> str:
-    """`table`, singularised for exactly one row.
+# Tables whose name is not itself a countable noun. "calendar" was previously
+# left unchanged on the grounds that it reads for one entry or many, which
+# produced "there are 6 calendar" out loud. A table absent from here falls
+# back to the plural-name heuristic below.
+_TABLE_NOUNS = {"calendar": ("calendar entry", "calendar entries")}
 
-    Every table this device has is named for its plural ("contacts",
-    "messages", "places") except "calendar", which already reads right for
-    one entry or many, so it is left alone. A table this heuristic gets
-    wrong just reads a little oddly -- it never touches n, the one number
-    that must always be exactly right.
+
+def _noun(table: str, n: int) -> str:
+    """`table` as a countable noun, singular for exactly one row.
+
+    Most tables here are named for their plural ("contacts", "messages",
+    "places") and just lose the trailing s. A table this gets wrong only
+    reads a little oddly -- it never touches n, the one number that must
+    always be exactly right.
     """
+    if table in _TABLE_NOUNS:
+        singular, plural = _TABLE_NOUNS[table]
+        return singular if n == 1 else plural
     if n == 1 and table.endswith("s") and not table.endswith("ss"):
         return table[:-1]
     return table
