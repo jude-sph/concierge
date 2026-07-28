@@ -199,7 +199,13 @@ class VoiceService:
         # Above this per-chunk RMS the person is taken to be talking. Well
         # under the upstream far-field threshold on purpose: the whole point
         # is to hear the quiet speech that gets gated out up there.
+        # Absolute floor: below this nothing counts as speech however quiet
+        # the room is, so a silent line can never be mistaken for talking.
         speech_floor_rms: float = 0.008,
+        # How far above the measured background a chunk must sit to count as
+        # speech. 3x is roughly 10dB -- comfortably above the variation of
+        # steady room tone, comfortably below the level of someone talking.
+        speech_margin: float = 3.0,
     ):
         self.client = SoulXClient(soulx_url)
         self.adapter = StateAdapter()
@@ -236,7 +242,23 @@ class VoiceService:
         # was split and the second half is on its way. This is the audio it
         # discarded, and it is what holds the merge window open (see
         # Orchestrator._merge_expired).
+        # The threshold ADAPTS to the room. A fixed floor was the mistake: at
+        # 0.008 RMS, ordinary room tone through a laptop microphone counts as
+        # speech, so `quiet_ms` never grew, the merge window thought the
+        # person was still talking, and it held on. Measured live, dispatch to
+        # the reasoner had a p90 of 5.2s against an intended ceiling of 2.5s,
+        # and that overshoot is most of the delay before an answer is spoken.
+        #
+        # A fixed floor cannot be right for both a quiet room and a noisy one,
+        # and the quantity that matters is not loudness but whether this chunk
+        # stands out from the background. So the background is measured
+        # continuously and speech is what exceeds it by a margin.
         self.speech_floor_rms = speech_floor_rms
+        self.speech_margin = speech_margin
+        # Starts at the floor and falls fast/rises slow (see feed_audio), so a
+        # room is characterised within a second or two of silence and a long
+        # utterance cannot drag the estimate up into its own level.
+        self.noise_rms = speech_floor_rms
         self.last_speech_ms: int | None = None
         self.agc = agc
         # `agc_target_rms` predates the switch to peak-targeted gain (see
@@ -419,7 +441,18 @@ class VoiceService:
         # be transcribed. This is the copy that still has the utterance's
         # onset in it -- the thing SoulX's far-field gate throws away.
         self.audio_log.append(chunk)
-        if self.last_agc_input_rms >= self.speech_floor_rms:
+        # Track the room: fall fast toward a new quiet level, rise slowly.
+        # Asymmetric on purpose -- a room that goes quiet should be recognised
+        # as quiet within a second, but a long utterance must not drag the
+        # background estimate up into its own level, which would make the
+        # speaker's own voice stop counting as speech partway through.
+        rms = self.last_agc_input_rms
+        if rms < self.noise_rms:
+            self.noise_rms = 0.85 * self.noise_rms + 0.15 * rms
+        else:
+            self.noise_rms = 0.999 * self.noise_rms + 0.001 * rms
+        threshold = max(self.speech_floor_rms, self.noise_rms * self.speech_margin)
+        if rms >= threshold:
             # The END of this chunk: the speech in it runs right up to there,
             # so that is the last moment we can say we heard anyone. Stamping
             # the start instead makes `quiet_ms` report a chunk of silence

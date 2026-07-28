@@ -51,6 +51,13 @@ So: never say the system lacks access or cannot look something up -- it can.
 The real answer is spoken separately the moment the reasoner has it, so do not
 invent it, and do not repeat the person's question back at them.
 
+YOU CANNOT SEE THE DATA. You do not know a single name, number, address,
+date or count on this phone, and you never will -- they are not in anything
+you are shown. So never put one in a sentence. Asked "what contact is ID 9?"
+the answer "Nine is Olivia" is not a guess that might be right; there is no
+Olivia, and the person is now holding a fact you made up about their phone.
+Say you are looking it up. The real answer follows on its own.
+
 Talk like a person, not a status light. Be warm, be brief, and vary how you
 say things -- you are having a conversation, and hearing the same stock phrase
 every single turn is worse than hearing nothing. React to the particular thing
@@ -101,6 +108,69 @@ _CONTROL_ECHO = re.compile(
 # "I'm onto it right now!" are the same tic, and a longer key lets it slip
 # through by adding a word.
 _PHRASE_KEY_WORDS = 3
+
+
+# Words the concierge may say in a fact-shaped position without having got
+# them from the person: the tables it is told about in SYSTEM_PROMPT, and the
+# handful of capitalised words English uses that assert nothing about anyone.
+_SAFE_WORDS = {
+    "contacts", "contact", "messages", "message", "calendar", "places",
+    "place", "phone", "i", "i'm", "i'll", "i've", "ok", "okay", "yes", "no",
+    "sure", "sorry", "hello", "hi", "hey", "thanks",
+}
+
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
+_WORD = re.compile(r"[A-Za-z][A-Za-z'’]*")
+_DIGITS = re.compile(r"\d+")
+
+
+def _norm(word: str) -> str:
+    """A word's identity for "was this said already?".
+
+    Strips the possessive and any apostrophes, so "Marcus's" matches the
+    "marcus" the person actually said -- otherwise echoing a name back becomes
+    an invention purely because it acquired an apostrophe.
+    """
+    word = word.lower()
+    for suffix in ("'s", "’s"):
+        if word.endswith(suffix):
+            word = word[: -len(suffix)]
+            break
+    return word.replace("'", "").replace("’", "")
+
+
+def invents_a_fact(reply: str, history: list[dict]) -> bool:
+    """Does this reply assert something about the phone it could not know?
+
+    The concierge is never given the device's data -- that is the structural
+    guarantee the design rests on -- but "has no data" and "will not state
+    data" are different things, and a small model asked a direct question
+    answers it. Live, asked "what contact is ID 9?" it said "Nine is Olivia."
+    There is no Olivia. It also produced "One is Aisha, Two is Daniel, Three
+    is Elena" for contacts it cannot see. The person is then holding invented
+    facts about their own phone, which is worse than any delay.
+
+    Detection is deliberately crude and biased toward silence: a name or a
+    number that has NOT been said in this conversation, appearing where it
+    would be read as a fact, means the model got it from nowhere. A word the
+    person themselves used is fine -- echoing "Marcus" back is conversation,
+    not invention.
+
+    The first word of each sentence is exempt because English capitalises it
+    regardless. The cost of a false positive is one silent turn, and the
+    reasoner still answers; the cost of a false negative is lying to someone
+    about their contacts.
+    """
+    known = {_norm(w) for m in history for w in _WORD.findall(m.get("content", ""))}
+    known |= {d for m in history for d in _DIGITS.findall(m.get("content", ""))}
+    known |= {_norm(w) for w in _SAFE_WORDS}
+
+    for sentence in _SENTENCE_SPLIT.split(reply):
+        words = _WORD.findall(sentence)
+        for word in words[1:]:                       # skip sentence-initial
+            if word[0].isupper() and _norm(word) not in known:
+                return True
+    return any(d not in known for d in _DIGITS.findall(reply))
 
 
 def _phrase_key(text: str) -> str:
@@ -185,6 +255,9 @@ class Concierge:
         self.violations = 0
         # How often a reply had to be re-rolled for repeating a recent one.
         self.repeats = 0
+        # How often a reply was discarded for stating a fact about the phone
+        # that nobody had said. The one number here worth watching.
+        self.inventions = 0
 
     async def respond(
         self,
@@ -252,6 +325,14 @@ class Concierge:
             fresh = await self._generate(retry, temperature=1.0)
             if fresh:
                 reply = fresh
+
+        # Checked against the CONVERSATION, not the reply alone: a name is
+        # only invented if nobody said it. Done after the re-roll so a reply
+        # is never silenced for repeating itself and inventing at once.
+        if reply and invents_a_fact(reply, history):
+            self.inventions += 1
+            self.violations += 1
+            return ""
 
         if not reply:
             self.violations += 1

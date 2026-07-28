@@ -15,7 +15,7 @@ import httpx
 import pytest
 
 from rtvoice.concierge import (MAX_REPLY_CHARS, Concierge, _phrase_key,
-                               clean_reply)
+                               clean_reply, invents_a_fact)
 from rtvoice.protocol import ReasonerMessage
 from rtvoice.registry import TaskRegistry
 
@@ -292,3 +292,68 @@ def test_a_reply_echoing_our_own_labels_is_never_spoken(echo):
 
 def test_a_sentence_that_merely_mentions_a_task_still_speaks():
     assert clean_reply("Looking up your calendar now.") == "Looking up your calendar now."
+
+
+# --- never stating a fact about the phone ------------------------------------
+#
+# The concierge is never given the device's data, but "has no data" and "will
+# not state data" are different things. Asked "what contact is ID 9?" it
+# replied "Nine is Olivia." There is no Olivia.
+
+def test_a_name_nobody_said_is_an_invention():
+    history = [{"role": "user", "content": "What contact is ID 9?"}]
+    assert invents_a_fact("Nine is Olivia.", history)
+
+
+def test_a_list_of_invented_names_is_caught():
+    history = [{"role": "user", "content": "one, two, and three."}]
+    assert invents_a_fact("One is Aisha, Two is Daniel, Three is Elena.", history)
+
+
+def test_a_count_nobody_said_is_an_invention():
+    """Counts come from the device, never from a model -- that property is the
+    reason destructive writes are safe to confirm."""
+    assert invents_a_fact("You have 11 contacts.", [])
+
+
+def test_echoing_a_name_the_person_used_is_fine():
+    """That is conversation, not invention."""
+    history = [{"role": "user", "content": "delete the messages from marcus"}]
+    assert not invents_a_fact("Sure, I'll look for Marcus's messages.", history)
+
+
+def test_an_ordinary_acknowledgement_passes():
+    for reply in ["Sure thing, one moment.", "Got it, checking your calendar now.",
+                  "Hello, how can I help?", "I'm on it.",
+                  "Okay. Let me look that up for you."]:
+        assert not invents_a_fact(reply, []), reply
+
+
+def test_a_number_the_person_said_may_be_repeated():
+    history = [{"role": "user", "content": "add 16 Kathleen Gardens"}]
+    assert not invents_a_fact("Got it, 16 Kathleen Gardens.", history)
+
+
+@pytest.mark.asyncio
+async def test_an_invented_fact_is_never_spoken(monkeypatch):
+    c = Concierge()
+    monkeypatch.setattr(c._client, "post", _FakePost(content="Nine is Olivia."))
+
+    reply = await c.respond(TaskRegistry(), [
+        {"role": "user", "content": "What contact is ID 9?"}], "user_turn")
+
+    assert reply == ""
+    assert c.inventions == 1
+
+
+@pytest.mark.asyncio
+async def test_a_safe_reply_to_the_same_question_is_spoken(monkeypatch):
+    c = Concierge()
+    monkeypatch.setattr(c._client, "post",
+                        _FakePost(content="Let me look that one up."))
+
+    reply = await c.respond(TaskRegistry(), [
+        {"role": "user", "content": "What contact is ID 9?"}], "user_turn")
+
+    assert reply == "Let me look that one up."
+    assert c.inventions == 0

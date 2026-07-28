@@ -81,7 +81,11 @@ OPERATIONS - the device supports these and nothing else:
   insert       add ONE new row. "values" is the whole record. Never set "id";
                the device assigns it.
   unsupported  a real-world action with nothing on the device behind it
-               (ordering a car, placing a call).
+               (ordering a car, placing a call). NOT for something the device
+               can plainly do but you lack the details for -- adding a place,
+               renaming a contact and deleting a message are all supported, so
+               "unsupported" for any of them states a falsehood about this
+               phone. When the details are missing, use "none".
   none         chit-chat, nothing actionable, or a question ABOUT the
                system itself rather than a request to look something up.
 
@@ -144,7 +148,9 @@ RULES:
   describes nothing real and that the person never asked for, and they will
   be told it was added. An offer to act is not an instruction to act: "can
   you add a place", "can you delete?", "could you rename someone" are asking
-  whether the system CAN, and the answer is a conversation, not a write.
+  whether the system CAN, and the answer is a conversation, not a write. Use
+  "none" for those - NOT "unsupported", which would say the phone cannot do
+  it, and the phone plainly can.
 - Earlier turns are there to resolve REFERENCES ("do it for her too", "the
   same for Marcus"), and for nothing else. A write must name its target and
   its new value in THIS turn, or inherit them from a turn that plainly
