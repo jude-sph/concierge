@@ -283,11 +283,15 @@ async def test_the_remote_engine_is_asked_one_clause_at_a_time():
     """Not the whole utterance: the caller runs a clause ahead of playback, so
     every round trip after the first is overlapped with speaking the previous
     clause and only the FIRST is ever waited on."""
+    from rtvoice.tts import RemoteTTS
     http = _FakeHTTP()
     text = "Okay, hold on a moment. I am checking that for you right now."
     await _drain(_remote(http).stream(text))
 
-    assert http.sent == split_for_streaming(text)
+    # The engine's own limits, not the module defaults -- which is the whole
+    # point of clause sizing being a property of the engine.
+    assert http.sent == split_for_streaming(
+        text, RemoteTTS.first_clause_chars, RemoteTTS.clause_chars)
     assert len(http.sent) > 1
 
 
@@ -340,3 +344,24 @@ async def test_a_slow_engine_speaks_sooner_than_a_fast_one_would():
 
     assert len(http.sent[0]) <= RemoteTTS.first_clause_chars
     assert len(http.sent[0]) < len(split_for_streaming(reply)[0])
+
+
+def test_pieces_do_not_come_out_wildly_uneven():
+    """A tiny piece in front of a big one is what causes a mid-sentence pause
+    on a slow engine: a clause takes about as long to make as to say, so the
+    short one runs out of audio long before the long one is ready.
+
+    "Right, hang on -- I'm pulling up your contacts now." has exactly one
+    comma, six characters in. Splitting there left 0.6s of speech in front of
+    2.5s, and it gapped audibly every time that phrasing came up.
+    """
+    pieces = split_for_streaming(
+        "Right, hang on -- I'm pulling up your contacts now.", 48, 150)
+    assert len(pieces[0]) > 20, f"first piece far too short: {pieces[0]!r}"
+
+
+def test_a_punctuation_break_near_the_limit_is_still_preferred():
+    """Evenness must not cost the natural breath -- a comma at a sensible
+    place is still where the split belongs."""
+    text = "Okay, that'll delete 3 messages from Marcus. Want me to go ahead?"
+    assert split_for_streaming(text, 48, 150)[0].endswith("Marcus.")

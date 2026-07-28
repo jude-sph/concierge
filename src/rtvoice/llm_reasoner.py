@@ -113,6 +113,13 @@ RULES:
 - "table" must be one of the tables below. Every key in "where" and "values"
   must be a field that exists on that table, and every value must be a plain
   string, number or boolean, copied in the exact form the schema shows.
+- A FIELD BELONGS TO ONE TABLE ONLY. Check the field you are about to use
+  against the table you chose, in the schema below, every time. Two tables
+  naming a person do not name them the same way, and the schema lists a
+  person's full name as a value of "contact" - which is a field on MESSAGES.
+  Writing that onto "contacts" (where people are stored as "first_name" and
+  "last_name") matches nothing, and the person is then told their contact
+  does not exist while they are looking at it.
 - Resolve relative dates ("tomorrow", "Friday") into the exact date format the
   schema shows, using the dates given below. Never write a relative word into
   a filter.
@@ -169,6 +176,20 @@ EXAMPLES (table names and dates below are illustrative, not the real device):
     "understood_as": "rename Priya to Jude Hawrani"}]}
   Note: "where" is Priya's CURRENT name. "Jude" and "Hawrani" are the NEW
   values and appear ONLY in "values", never in "where".
+
+  "delete the contact Sarah Chen" ->
+  {"intents": [{"operation": "delete", "table": "contacts",
+    "where": {"first_name": "Sarah", "last_name": "Chen"},
+    "understood_as": "delete the contact Sarah Chen"}]}
+  Note: a full name on the CONTACTS table is TWO fields. {"contact": "Sarah
+  Chen"} is the messages table's way of naming a person and matches no
+  contact at all.
+
+  "delete Sarah Chen's messages" ->
+  {"intents": [{"operation": "delete", "table": "messages",
+    "where": {"contact": "Sarah Chen"},
+    "understood_as": "delete Sarah Chen's messages"}]}
+  Note: the same person, a different table, therefore a different field.
 
   "change my work contacts to Hans" ->
   {"intents": [{"operation": "update", "table": "contacts",
@@ -781,6 +802,10 @@ class LlmReasoner:
         self.latency_ms = latency_ms
         self.history_turns = history_turns
         self.misreads = 0
+        # How often a plan named a field its table does not have and had to be
+        # sent back. Worth watching: it is the single most common way this
+        # model misreads the device, and each one costs a second round trip.
+        self.field_corrections = 0
         # Injectable so "tomorrow" is testable without waiting for tomorrow.
         self.now = now or dt.datetime.now
         self._pending: dict[str, dict] = {}
@@ -895,17 +920,68 @@ class LlmReasoner:
 
         content = await self._post(messages)
         plan, err = self._to_plan(content)
-        if plan is not None:
-            return plan
 
-        messages.append({"role": "system", "content":
-                          f"That reply could not be read as a plan ({err}). "
-                          "Reply with a single JSON object and nothing else."})
-        content = await self._post(messages)
-        plan, err = self._to_plan(content)
         if plan is not None:
-            return plan
+            complaint = self._field_complaint(plan)
+            if complaint is None:
+                return plan
+            # The plan parsed but names a field its table does not have, which
+            # this model does repeatedly and which no amount of prompting has
+            # fixed: told plainly that a person on `contacts` is
+            # first_name + last_name, and shown two worked examples, a 3B
+            # still writes {"contact": "Sarah Chen"} -- because the schema
+            # lists exactly that string as a value of `messages.contact`.
+            #
+            # So it is corrected the same way malformed JSON already is: hand
+            # back the specific mistake and let it try again. That is general
+            # (any wrong field on any table, not a rule about names) and it
+            # gives the model the one fact it demonstrably lacks at the moment
+            # of generating -- WHICH field it got wrong, and what the real
+            # ones are.
+            self.field_corrections += 1
+            messages.append({"role": "system", "content": complaint})
+        else:
+            messages.append({"role": "system", "content":
+                              f"That reply could not be read as a plan ({err}). "
+                              "Reply with a single JSON object and nothing else."})
+
+        content = await self._post(messages)
+        retried, err = self._to_plan(content)
+        if retried is not None:
+            # Second attempt wins only if it is actually better; a retry that
+            # reintroduces the same bad field would otherwise replace a plan
+            # that at least parsed.
+            if plan is None or self._field_complaint(retried) is None:
+                return retried
+        if plan is not None:
+            return plan          # corrected attempt was no better; report the original
         raise ValueError(f"invalid plan after retry: {err}")
+
+    def _field_complaint(self, plan: Plan) -> Optional[str]:
+        """The specific "that field is not on that table" message, or None.
+
+        Deliberately names the offending key AND lists the table's real
+        fields: the schema block is already in the prompt and was ignored, so
+        what is added here is not more information but a pointed correction at
+        the moment it is needed.
+        """
+        for intent in plan.intents:
+            if intent.operation not in DEVICE_OPERATIONS or not intent.table:
+                continue
+            fields = self._table_fields(intent.table)
+            if not fields:
+                continue
+            for source in (intent.where or {}, intent.values or {}):
+                for key in source:
+                    if key not in fields:
+                        return (
+                            f'"{intent.table}" has no field "{key}". Its fields '
+                            f'are: {", ".join(sorted(fields))}. A person on '
+                            f'"contacts" is first_name plus last_name. Redo the '
+                            f"plan using only fields that exist on the table you "
+                            f"chose, and reply with a single JSON object."
+                        )
+        return None
 
     # --- protocol ------------------------------------------------------------
 
@@ -1033,7 +1109,14 @@ class LlmReasoner:
                 # so anything scalar is allowed; otherwise rows stay uniform.
                 if fields and key not in fields:
                     if is_where:
-                        return f"I couldn't find a {noun} matching that."
+                        # NOT "I couldn't find a contact matching that". The
+                        # device was never searched -- the filter named a
+                        # field this table does not have, which is a mistake
+                        # on our side. Reporting it as absence is a false
+                        # statement about the phone, and the person hears it
+                        # while looking at the record on screen.
+                        return (f"I couldn't work out how to look that {noun} "
+                                "up -- try saying it another way?")
                     return f"that's not something I can set on a {noun}."
                 if value is not None and not isinstance(value, _SCALARS):
                     if is_where:

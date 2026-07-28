@@ -83,7 +83,12 @@ def _get_model():
         # caches into `model.conds`, and generate() uses that when no prompt
         # is passed.
         if VOICE_REF:
-            _model.prepare_conditionals(VOICE_REF)
+            # exaggeration MUST match what generate() would have used, which
+            # for turbo is 0.0 -- prepare_conditionals defaults to 0.5, so
+            # simply hoisting the call silently changed the voice's emotion
+            # conditioning as well as making it faster. Two variables at once
+            # is how a speed fix gets blamed for sounding worse.
+            _model.prepare_conditionals(VOICE_REF, exaggeration=0.0)
 
         # The first generation is several times slower than the rest (kernel
         # autotuning, lazy weight materialisation). Spend that here, at

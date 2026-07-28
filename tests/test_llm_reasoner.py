@@ -847,12 +847,19 @@ async def test_a_bad_intent_does_not_kill_its_siblings(tmp_path):
 
 @pytest.mark.asyncio
 async def test_unknown_where_field_is_spoken_as_plain_english(tmp_path):
-    """The second live-session failure: asked to look up a contact, the model
-    filtered on "contact" -- a field that exists on `messages`, not
-    `contacts`. The device correctly refuses (that key isn't on this table),
-    but what got spoken was "contacts has no contact": ungrammatical, and it
-    named an internal field the user never said. The refusal must instead
-    read as something a person would say, with no raw table.field jargon."""
+    """Asked to look up a contact, the model filtered on "contact" -- a field
+    that exists on `messages`, not `contacts`. The device correctly refuses
+    (that key isn't on this table), but what got spoken was "contacts has no
+    contact": ungrammatical, and it named an internal field the user never
+    said. The refusal must read as something a person would say, with no raw
+    table.field jargon.
+
+    It must ALSO not claim the record is absent. "I couldn't find a contact
+    matching that" says the phone was searched and Sarah Chen is not on it --
+    spoken to someone looking at her on screen. Nothing was searched: the
+    filter named a field this table does not have, which is our mistake, not
+    a fact about their contacts.
+    """
     reasoner, _ = build(tmp_path, plan({
         "operation": "query", "table": "contacts", "where": {"contact": "Tom"},
     }))
@@ -861,10 +868,26 @@ async def test_unknown_where_field_is_spoken_as_plain_english(tmp_path):
 
     assert kinds(out) == ["ack", "failed"]
     reason = only(out, "failed").reason
-    assert reason == "I couldn't find a contact matching that."
     assert "has no" not in reason
     assert "contacts.contact" not in reason
+    assert "find" not in reason, "must not report a lookup that never happened"
     assert reasoner.misreads == 1
+
+
+@pytest.mark.asyncio
+async def test_a_genuinely_absent_record_still_reads_as_absent(tmp_path):
+    """The contrast case. A filter on a REAL field that matches nothing is a
+    true statement about the device, and must keep saying so -- the fix above
+    must not blur the two together."""
+    reasoner, _ = build(tmp_path, plan({
+        "operation": "query", "table": "contacts",
+        "where": {"first_name": "Nobody"},
+    }))
+
+    out = await say(reasoner, "look up Nobody")
+
+    assert kinds(out) == ["ack", "done"]
+    assert "no contacts" in only(out, "done").result
 
 
 @pytest.mark.asyncio
@@ -1351,3 +1374,91 @@ async def test_a_failed_turn_is_still_reported_to_the_person(tmp_path):
     out = await say(reasoner, "do something")
 
     assert out[0].kind == "failed" and out[0].reason
+
+
+# --- correcting a field the table does not have -----------------------------
+#
+# The model writes {"contact": "Sarah Chen"} against `contacts` -- repeatedly,
+# for delete, query AND update -- because the schema block lists exactly that
+# string as a value of `messages.contact`. Told plainly that a person on
+# `contacts` is first_name + last_name, and shown two worked examples, a 3B
+# still does it. So it is corrected the same way malformed JSON already is.
+
+@pytest.mark.asyncio
+async def test_a_wrong_field_is_sent_back_for_correction(tmp_path):
+    reasoner, fake = build(
+        tmp_path,
+        plan({"operation": "delete", "table": "contacts",
+              "where": {"contact": "Sarah Chen"}}),
+        plan({"operation": "delete", "table": "contacts",
+              "where": {"first_name": "Sarah", "last_name": "Chen"}}),
+    )
+
+    out = await say(reasoner, "delete the contact Sarah Chen")
+
+    assert kinds(out) == ["ack", "confirm_required"], "the corrected plan runs"
+    assert reasoner.field_corrections == 1
+
+
+@pytest.mark.asyncio
+async def test_the_correction_names_the_field_and_the_real_ones(tmp_path):
+    """The schema is already in the prompt and was ignored. What the retry
+    adds is not more information but a pointed correction: which key was
+    wrong, and what the table actually has."""
+    reasoner, fake = build(
+        tmp_path,
+        plan({"operation": "query", "table": "contacts",
+              "where": {"contact": "Sarah Chen"}}),
+        plan({"operation": "query", "table": "contacts",
+              "where": {"first_name": "Sarah"}}),
+    )
+
+    await say(reasoner, "who is Sarah Chen")
+
+    correction = fake.calls[1]["messages"][-1]["content"]
+    assert '"contact"' in correction
+    assert "first_name" in correction and "last_name" in correction
+
+
+@pytest.mark.asyncio
+async def test_a_correct_plan_is_never_retried(tmp_path):
+    """Every correction costs a second round trip on the slowest component."""
+    reasoner, fake = build(tmp_path, plan({
+        "operation": "query", "table": "contacts", "where": {"group": "work"}}))
+
+    await say(reasoner, "who is in my work group")
+
+    assert len(fake.calls) == 1
+    assert reasoner.field_corrections == 0
+
+
+@pytest.mark.asyncio
+async def test_a_retry_that_is_no_better_does_not_replace_the_first_plan(tmp_path):
+    """Both name a bad field, so nothing was gained -- and the original at
+    least parsed. The device must still refuse, not act on either."""
+    bad = plan({"operation": "delete", "table": "contacts",
+                "where": {"contact": "Sarah Chen"}})
+    reasoner, fake = build(tmp_path, bad, bad)
+
+    out = await say(reasoner, "delete the contact Sarah Chen")
+
+    assert kinds(out) == ["ack", "failed"]
+    assert names(reasoner) == ["Sarah", "Marcus", "Priya", "Tom"], "nothing deleted"
+
+
+@pytest.mark.asyncio
+async def test_a_wrong_field_in_values_is_corrected_too(tmp_path):
+    """An unknown key in `values` is worse than one in `where`: an update
+    would silently ADD that field to every matched row."""
+    reasoner, fake = build(
+        tmp_path,
+        plan({"operation": "update", "table": "contacts",
+              "where": {"first_name": "Sarah"}, "values": {"nickname": "Sar"}}),
+        plan({"operation": "update", "table": "contacts",
+              "where": {"first_name": "Sarah"}, "values": {"last_name": "Sar"}}),
+    )
+
+    out = await say(reasoner, "give Sarah a nickname")
+
+    assert kinds(out) == ["ack", "confirm_required"]
+    assert reasoner.field_corrections == 1

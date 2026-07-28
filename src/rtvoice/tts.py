@@ -77,19 +77,35 @@ _SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
 _CLAUSE_BREAK = re.compile(r"(?<=[,;:])\s+")
 
 
+# A punctuation break is only worth taking if it lands somewhere near the
+# limit. Pieces that come out WILDLY uneven are what cause mid-sentence
+# pauses on a slow engine: a clause takes about as long to synthesize as it
+# takes to say, so a tiny piece followed by a big one runs out of audio long
+# before the big one is ready. "Right, hang on -- I'm pulling up your
+# contacts now." has exactly one comma, six characters in, and splitting
+# there left a 0.6s clause in front of a 2.5s one -- an audible gap, every
+# time that phrasing came up.
+MIN_FILL = 0.5
+
+
 def _split_once(text: str, limit: int) -> tuple[str, str]:
     """Take a prefix no longer than `limit`, broken at the best place available.
 
     Preference order is sentence end, then clause punctuation, then a word
-    boundary. A hard character cut is the last resort and only happens for a
-    single word longer than the limit, where there is no better answer.
+    boundary -- but a punctuation break is ignored when it would leave a piece
+    shorter than MIN_FILL of the limit, in which case a word boundary nearer
+    the limit gives more even pieces. A hard character cut is the last resort
+    and only happens for a single word longer than the limit, where there is
+    no better answer.
     """
     text = text.strip()
     if len(text) <= limit:
         return text, ""
 
+    floor = int(limit * MIN_FILL)
     for pattern in (_SENTENCE_END, _CLAUSE_BREAK):
-        cuts = [m.end() for m in pattern.finditer(text) if m.end() <= limit]
+        cuts = [m.end() for m in pattern.finditer(text)
+                if floor <= m.end() <= limit]
         if cuts:
             return text[:cuts[-1]].strip(), text[cuts[-1]:].strip()
 
@@ -274,12 +290,20 @@ class RemoteTTS(StreamingTTS):
     reasoner result the person is waiting on.
     """
 
-    # Sized for an engine at roughly realtime rather than 30x it. The first
-    # clause is deliberately short -- about a second of speech -- because its
-    # synthesis is silence the listener is sitting through; the rest are long,
-    # because by then audio is playing and only prosody is at stake.
-    first_clause_chars = 24
-    clause_chars = 110
+    # A SHORT first clause followed by a long one is the worst of both worlds,
+    # and trying it proved why. At roughly realtime, a clause takes about as
+    # long to make as it takes to say -- so clause n+1 is ready in time only
+    # if it is no longer than clause n. Opening with 24 characters (~1.5s of
+    # speech) and following it with 110 (~7s) guarantees the second is still
+    # being made when the first runs out: audible mid-sentence pause, every
+    # time. Short clauses also carry no prosodic context, so each one restarts
+    # flat -- which is the "monotone and robotic" half of the same report.
+    #
+    # So the pieces stay comparable in size, and the cost is taken where it is
+    # least harmful: a slightly longer wait before the first word, and none
+    # after it. This engine cannot have both; a faster one could.
+    first_clause_chars = 48
+    clause_chars = 150
     # Two clauses of buffer, not one: at ~1x realtime, making the next clause
     # takes about as long as playing the current one, so a single-slot queue
     # leaves no slack for a slow round trip and the sentence gaps audibly.
